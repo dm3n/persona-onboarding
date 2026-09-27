@@ -199,8 +199,13 @@ const scenarios = {
       await settle(page);
     }
     const t2 = await transcript(page);
+    // Mentioning that Gmail is off the table is fine. Asking for it again is not.
     const recent = t2.messages.slice(-2).join(' ').toLowerCase();
-    check('refuse: does not ask again', !/gmail|email address|@/.test(recent), recent.slice(0, 160));
+    const reasks =
+      /(?:connect|share|give|type|what(?:'s| is)?|which|your)[^.?!]{0,40}(?:gmail|email)[^.?!]{0,40}\?/.test(recent) ||
+      /(?:gmail|email)[^.?!]{0,30}\?/.test(recent);
+    check('refuse: does not ask again', !reasks, recent.slice(0, 200));
+    check('refuse: does not recite a checklist', !/three out of four|\b[1-4] of 4\b|main things are/.test(recent), recent.slice(0, 200));
     await browser.close();
   },
 

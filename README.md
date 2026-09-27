@@ -5,7 +5,7 @@ what you want to call your agent, what it should call you, the Gmail it works in
 one real job to start on. It offers to do most of that over a voice call, and it holds
 together when people do not cooperate.
 
-Live: https://persona-onboarding.vercel.app
+Live: https://persona-setup.vercel.app
 
 ## The idea
 

@@ -288,6 +288,7 @@ export async function POST(req: Request) {
 
       const scrub = createScrubber(body.channel);
       let sawText = false;
+      let fullText = "";
       let textBlocks = 0;
       let rememberedSomething = false;
       try {
@@ -319,11 +320,15 @@ export async function POST(req: Request) {
             // A tool call between two text blocks otherwise glues the
             // sentences together with no space.
             textBlocks++;
-            if (textBlocks > 1 && sawText) send({ t: "delta", v: " " });
+            if (textBlocks > 1 && sawText) {
+              fullText += " ";
+              send({ t: "delta", v: " " });
+            }
           } else if (part.type === "text-delta" && part.text) {
             const clean = scrub(part.text);
             if (!clean) continue;
             sawText = true;
+            fullText += clean;
             send({ t: "delta", v: clean });
           } else if (part.type === "error") {
             throw part.error;
@@ -385,6 +390,24 @@ export async function POST(req: Request) {
           found[id] = value;
         }
         if (Object.keys(found).length) send({ t: "patch", v: found });
+      }
+
+      /*
+       * Every reply has to leave the ball in their court.
+       *
+       * A model that has just declined something ("I can't help with that.")
+       * sometimes stops there, which strands the user in an onboarding with no
+       * question in front of them. If the turn ended without one and there is
+       * still something to collect, ask for it.
+       */
+      if (
+        sawText &&
+        body.channel === "chat" &&
+        !fullText.includes("?") &&
+        missingSlots(profile).length > 0 &&
+        !actions.some((a) => a.kind === "graduate" || a.kind === "place_call")
+      ) {
+        send({ t: "delta", v: `\n\n${fallbackReply(profile, false)}` });
       }
 
       // A turn that called tools but wrote nothing still owes the user words.
