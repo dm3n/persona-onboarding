@@ -106,6 +106,8 @@ pnpm dev
 pnpm test:e2e                  # the full matrix above, against localhost
 node e2e/stress.cjs call       # one scenario
 BASE=https://... pnpm test:e2e # against a deployment
+pnpm check:slots               # the normalisers, against their awkward cases
+pnpm typecheck && pnpm lint
 ```
 
 Speech recognition needs Chrome or Edge. Everywhere else the call runs with captions and

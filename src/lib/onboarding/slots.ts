@@ -38,7 +38,7 @@ export function newProfile(): Profile {
  * ------------------------------------------------------------------ */
 
 const LEADING_JUNK =
-  /^(?:ok(?:ay)?|well|um+|uh+|hi|hey|hello|so|yeah|yes|sure|please|just|i(?:'m| am)?|my name(?:'s| is)?|call me|it(?:'s| is)?|this is|the name(?:'s| is)?|name(?:'s| is)?|let(?:'s| us) (?:go with|call it|name (?:it|her|him))|go with|name (?:it|her|him)|we can call (?:it|her|him)|how about|maybe|lets|let's)\b[\s,.:-]*/i;
+  /^(?:ok(?:ay)?|well|um+|uh+|hi|hey|hello|so|yeah|yes|sure|please|just|i(?:'m| am)?|my name(?:'s| is)?|call (?:me|it|you|him|her|them)|you(?:'re| are)|your name(?:'s| is)?|it(?:'s| is)?|this is|the name(?:'s| is)?|name(?:'s| is)?|let(?:'s| us) (?:go with|call (?:it|you)|name (?:it|her|him|you))|go with|name (?:it|her|him|you|yourself)|we can call (?:it|him|her|you)|how about|maybe|lets|let's)\b[\s,.:-]*/i;
 
 function stripJunk(input: string): string {
   let out = input.trim();
@@ -98,10 +98,16 @@ export function normalizeName(raw: string | null | undefined): string | null {
   if (!v) return null;
   if (v.length > 40) return null;
 
+  // Letters, marks, digits and the punctuation real names contain. Anything
+  // else means we are looking at a sentence or at keyboard mashing.
+  if (/[^\p{L}\p{M}0-9'\u2019\-. ]/u.test(v)) return null;
+
   const words = v.split(" ");
   if (words.length > 3) return null;
   if (words.some((w) => w.length > 20)) return null;
-  if (!/[a-z]/i.test(v)) return null;
+  if (!/\p{L}/u.test(v)) return null;
+  // At least one word has to actually be a word.
+  if (!words.some((w) => /^[\p{L}\p{M}'\u2019-]{2,}$/u.test(w))) return null;
   // Reject bare filler and obvious non-answers.
   if (words.every((w) => NAME_STOPWORDS.has(w.toLowerCase()))) return null;
   // Reject anything that reads like a sentence fragment with a verb we know.
@@ -110,7 +116,7 @@ export function normalizeName(raw: string | null | undefined): string | null {
 
   v = words
     .map((w) => {
-      if (/^[A-Z0-9.]{2,}$/.test(w)) return w; // keep acronyms like "AJ"
+      if (/^[\p{Lu}0-9.]{2,}$/u.test(w)) return w; // keep acronyms like "AJ"
       if (w.includes("-")) {
         return w
           .split("-")
@@ -159,6 +165,9 @@ export function isGmailAddress(email: string): boolean {
 const NEED_LEAD =
   /^(?:i(?:'?d)?\s+(?:really\s+)?(?:need|want|would like|could use)\s+(?:some\s+)?help\s+(?:with\s+|on\s+)?|help\s+me\s+(?:with\s+)?|i\s+need\s+|i\s+want\s+|can you\s+(?:help\s+me\s+)?(?:with\s+)?|please\s+)/i;
 
+/** "help staying on top of X" reads better stored as "staying on top of X". */
+const NEED_BARE_HELP = /^help\s+(?=\w+ing\b)/i;
+
 /**
  * The "what do you need help with" slot.
  *
@@ -168,7 +177,7 @@ const NEED_LEAD =
 export function normalizeNeed(raw: string | null | undefined): string | null {
   if (!raw) return null;
   let v = String(raw).replace(/\s+/g, " ").trim();
-  const trimmed = v.replace(NEED_LEAD, "").trim();
+  const trimmed = v.replace(NEED_LEAD, "").replace(NEED_BARE_HELP, "").trim();
   if (trimmed.length >= 3) v = trimmed;
   if (!v) return null;
   if (v.length < 3) return null;
