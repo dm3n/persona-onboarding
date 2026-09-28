@@ -240,4 +240,3 @@ function eventLine(event: TurnEvent | undefined, p: Profile): string {
 export const OPENING_MESSAGE =
   "I'm Persona. Give me sixty seconds and I'll be yours.\n\nFirst thing, and the only one I can't work out myself: what do you want to call me?";
 
-export const OPENING_SUGGESTIONS = ["Ada", "Scout", "Goose", "You pick"];
