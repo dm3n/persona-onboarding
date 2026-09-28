@@ -1,4 +1,7 @@
+# esbuild ships a platform binary from a postinstall script. pnpm refuses to run
+# it unless it is named here, and fails the whole install rather than warning,
+# which is enough to break a deploy.
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: true
   sharp: false
   unrs-resolver: false
