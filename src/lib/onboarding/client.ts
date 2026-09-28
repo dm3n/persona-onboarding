@@ -6,6 +6,7 @@ export type TurnHandlers = {
   onDelta(text: string): void;
   onPatch(patch: Extract<StreamLine, { t: "patch" }>["v"]): void;
   onDeclined(slots: Extract<StreamLine, { t: "declined" }>["v"]): void;
+  onAsked(slot: Extract<StreamLine, { t: "asked" }>["v"]): void;
   onAction(action: Extract<StreamLine, { t: "action" }>["v"]): void;
   onSuggestions(list: string[]): void;
 };
@@ -95,6 +96,9 @@ function dispatch(line: StreamLine, h: TurnHandlers) {
       break;
     case "declined":
       h.onDeclined(line.v);
+      break;
+    case "asked":
+      h.onAsked(line.v);
       break;
     case "action":
       h.onAction(line.v);

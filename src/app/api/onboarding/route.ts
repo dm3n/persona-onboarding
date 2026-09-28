@@ -3,7 +3,12 @@ import { stepCountIs, streamText, tool } from "ai";
 import { z } from "zod";
 
 import { fallbackReply, fallbackSuggestions } from "@/lib/onboarding/fallback";
-import { readIntent, salvage, slotInMessage } from "@/lib/onboarding/intent";
+import {
+  mentionsSlot,
+  readIntent,
+  salvage,
+  slotInMessage,
+} from "@/lib/onboarding/intent";
 import { rescueSlots } from "@/lib/onboarding/rescue";
 import { createScrubber } from "@/lib/onboarding/scrub";
 import { buildSystemPrompt } from "@/lib/onboarding/prompt";
@@ -123,6 +128,21 @@ export async function POST(req: Request) {
     !intent.wantsSkip &&
     event?.type !== "call_ended";
 
+  /*
+   * Whether the job board is going up this turn, decided before the model
+   * runs so its words and the panel cannot disagree. Same reason the call
+   * offer is decided here: a guarantee the model is asked to narrate, never
+   * asked to remember.
+   */
+  const showFocusBoard =
+    body.channel === "chat" &&
+    !offerCallNow &&
+    !profile.wantsToSkip &&
+    !intent.wantsSkip &&
+    !profile.slots.need.value &&
+    !profile.slots.need.declined &&
+    nextSlot(profile) === "need";
+
   // Apply what we can be certain about before the model ever sees the prompt.
   if (intent.wantsSkip) profile.wantsToSkip = true;
   if (intent.refusesCall) {
@@ -198,6 +218,21 @@ export async function POST(req: Request) {
         for (const id of ["agentName", "userName", "gmail", "need"] as const) {
           const raw = input[id];
           if (typeof raw !== "string") continue;
+          /*
+           * "Let's just type" is a choice about the channel, not a job to be
+           * done. Saying no to a call, asking for one, or asking to skip is
+           * never an answer, and a model that hears one as the answer writes
+           * nonsense into the profile that nobody can get back out.
+           */
+          const asIntent = readIntent(raw);
+          if (
+            asIntent.refusesCall ||
+            asIntent.wantsCall ||
+            asIntent.wantsSkip ||
+            asIntent.refuses ||
+            asIntent.isBareGreeting
+          )
+            continue;
           const value = normalizeSlot(id, raw);
           if (!value) continue;
           profile.slots[id].value = value;
@@ -280,6 +315,15 @@ export async function POST(req: Request) {
             "End onboarding and open the workspace. Only when you have enough.",
           inputSchema: z.object({}),
           execute: async () => {
+            // The contract is the server's to keep. A model that decides on
+            // their behalf that Gmail does not matter does not get to.
+            if (!canGraduate(profile)) {
+              const left = missingSlots(profile);
+              return {
+                done: false,
+                reason: `Not yet. Still open: ${left.join(", ")}. Ask for ${left[0]} instead, unless they have told you to move on.`,
+              };
+            }
             pushAction({ kind: "graduate" });
             return { done: true };
           },
@@ -300,6 +344,7 @@ export async function POST(req: Request) {
             event,
             intent,
             offerCallNow,
+            showFocusBoard,
           }),
           messages: toModelMessages(body.messages, event, body.channel),
           tools,
@@ -400,14 +445,40 @@ export async function POST(req: Request) {
        * question in front of them. If the turn ended without one and there is
        * still something to collect, ask for it.
        */
+      const stillOpenNow = nextSlot(profile);
       if (
         sawText &&
         body.channel === "chat" &&
         !fullText.includes("?") &&
-        missingSlots(profile).length > 0 &&
-        !actions.some((a) => a.kind === "graduate" || a.kind === "place_call")
+        stillOpenNow &&
+        // A reply can deal with the open slot without ending in a question
+        // mark. Only rescue the ones that leave nothing to respond to.
+        !mentionsSlot(fullText, stillOpenNow) &&
+        !actions.some(
+          (a) =>
+            a.kind === "graduate" ||
+            a.kind === "place_call" ||
+            a.kind === "stage" ||
+            a.kind === "gmail_connect",
+        )
       ) {
         send({ t: "delta", v: `\n\n${fallbackReply(profile, false)}` });
+      }
+
+      /*
+       * Record that we asked and got nothing.
+       *
+       * Two unanswered asks is the point where continuing to push costs more
+       * than the missing field is worth, and canGraduate knows it.
+       */
+      if (
+        userDriven &&
+        askedFor &&
+        !profile.slots[askedFor].value &&
+        !profile.slots[askedFor].declined
+      ) {
+        profile.slots[askedFor].asks += 1;
+        send({ t: "asked", v: askedFor });
       }
 
       // A turn that called tools but wrote nothing still owes the user words.
@@ -426,6 +497,7 @@ export async function POST(req: Request) {
         body.channel,
         offerCallNow,
         userDriven,
+        showFocusBoard,
       );
       send({ t: "done" });
       close();
@@ -456,6 +528,7 @@ function applyGuarantees(
   channel: "chat" | "voice",
   offerCallNow: boolean,
   userDriven: boolean,
+  showFocusBoard: boolean,
 ) {
   const has = (k: TurnAction["kind"]) => actions.some((a) => a.kind === k);
 
@@ -492,6 +565,11 @@ function applyGuarantees(
   // First natural moment to offer the call, once only.
   if (offerCallNow && !has("place_call") && !has("graduate")) {
     push({ kind: "offer_call" });
+  }
+
+  // The job board, decided before the turn so the agent could introduce it.
+  if (showFocusBoard && !has("graduate") && !has("place_call")) {
+    push({ kind: "stage", stage: "focus" });
   }
 
   // Gmail is the one slot with a button. When it is the only thing left,

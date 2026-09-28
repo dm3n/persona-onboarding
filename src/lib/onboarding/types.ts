@@ -53,7 +53,29 @@ export type Profile = {
 export type Role = "assistant" | "user" | "system";
 
 export type MessageKind =
-  "text" | "gmail-card" | "call-summary" | "system-note";
+  | "text"
+  | "gmail-card"
+  | "call-summary"
+  | "system-note"
+  /** An interactive panel the agent drops into the conversation. */
+  | "stage";
+
+/**
+ * The interactive panels.
+ *
+ * Each one is a small stage where the agent does something first and then hands
+ * over. Whatever the user does there is turned back into an ordinary reply, so
+ * the transcript reads the same whether they tapped or typed.
+ */
+export const STAGE_IDS = ["name", "focus"] as const;
+export type StageId = (typeof STAGE_IDS)[number];
+
+export type StageState = {
+  stageId: StageId;
+  status: "active" | "done";
+  /** What they chose, phrased the way they would have said it. */
+  result?: string;
+};
 
 export type Message = {
   id: string;
@@ -85,6 +107,7 @@ export type TurnEvent =
 
 /** Server actions streamed back to the client. */
 export type TurnAction =
+  | { kind: "stage"; stage: StageId }
   | { kind: "offer_call" }
   | { kind: "place_call" }
   | { kind: "end_call"; reason?: string }
@@ -95,6 +118,7 @@ export type StreamLine =
   | { t: "delta"; v: string }
   | { t: "patch"; v: Partial<Record<SlotId, string>> & { notes?: string[] } }
   | { t: "declined"; v: SlotId[] }
+  | { t: "asked"; v: SlotId }
   | { t: "action"; v: TurnAction }
   | { t: "suggestions"; v: string[] }
   | { t: "error"; v: string }

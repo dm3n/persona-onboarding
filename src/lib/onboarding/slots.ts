@@ -241,9 +241,13 @@ export function callWouldHelp(p: Profile): boolean {
  * because holding someone hostage to a form is the failure mode we care about.
  */
 export function canGraduate(p: Profile): boolean {
-  if (missingSlots(p).length === 0) return true;
+  const missing = missingSlots(p);
+  if (missing.length === 0) return true;
+  if (!filled(p, "agentName")) return false;
+  // Asked twice with nothing to show for it. Badgering is worse than a gap.
+  if (missing.every((id) => p.slots[id].asks >= 2)) return true;
   if (!p.wantsToSkip) return false;
-  return filled(p, "agentName") && collectedCount(p) >= 2;
+  return collectedCount(p) >= 2;
 }
 
 /** The single thing to steer toward next, or null if we are done. */
