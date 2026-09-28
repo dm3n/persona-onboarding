@@ -17,6 +17,10 @@ export type RealtimeFailure =
   "mic_denied" | "unsupported" | "no_token" | "network" | "dropped";
 
 export type RealtimeHandlers = {
+  /** They have started talking. Nothing transcribed yet. */
+  onUserStarted(): void;
+  /** The user's words as they are still being transcribed. */
+  onUserPartial(text: string): void;
   /** A finished thing the user said. */
   onUserSaid(text: string): void;
   /** A finished thing the agent said. */
@@ -51,7 +55,9 @@ export function useRealtimeCall(handlers: RealtimeHandlers) {
   const audioCtx = useRef<AudioContext | null>(null);
   const raf = useRef<number | null>(null);
   const partial = useRef("");
+  const heardSoFar = useRef("");
   const stopped = useRef(false);
+  const dropTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Handlers change every render; the connection outlives them, so it reads
   // through a ref that is refreshed before anything can fire.
@@ -67,6 +73,8 @@ export function useRealtimeCall(handlers: RealtimeHandlers) {
 
   const teardown = useCallback(() => {
     stopped.current = true;
+    if (dropTimer.current) clearTimeout(dropTimer.current);
+    dropTimer.current = null;
     if (raf.current) cancelAnimationFrame(raf.current);
     raf.current = null;
     try {
@@ -92,6 +100,7 @@ export function useRealtimeCall(handlers: RealtimeHandlers) {
     void audioCtx.current?.close().catch(() => {});
     audioCtx.current = null;
     partial.current = "";
+    heardSoFar.current = "";
     setLevels({ input: 0, output: 0 });
   }, []);
 
@@ -187,8 +196,26 @@ export function useRealtimeCall(handlers: RealtimeHandlers) {
       }
 
       switch (type) {
+        case "input_audio_buffer.speech_started": {
+          /*
+           * Claim their place in the transcript the moment they open their
+           * mouth. Transcription runs alongside the model rather than ahead of
+           * it, so waiting for the first word would file what they said after
+           * the answer to it.
+           */
+          heardSoFar.current = "";
+          h.current.onUserStarted();
+          break;
+        }
+        case "conversation.item.input_audio_transcription.delta": {
+          heardSoFar.current += String(event.delta ?? "");
+          h.current.onUserPartial(heardSoFar.current);
+          break;
+        }
         case "conversation.item.input_audio_transcription.completed": {
-          const text = String(event.transcript ?? "").trim();
+          const text = String(event.transcript ?? heardSoFar.current).trim();
+          heardSoFar.current = "";
+          h.current.onUserPartial("");
           if (text) h.current.onUserSaid(text);
           break;
         }
@@ -325,12 +352,30 @@ export function useRealtimeCall(handlers: RealtimeHandlers) {
 
         connection.onconnectionstatechange = () => {
           const s = connection.connectionState;
-          if (s === "failed" || s === "disconnected" || s === "closed") {
-            if (!stopped.current) {
-              h.current.onFailure("dropped", s);
+          if (stopped.current) return;
+          if (dropTimer.current) {
+            clearTimeout(dropTimer.current);
+            dropTimer.current = null;
+          }
+          if (s === "failed" || s === "closed") {
+            h.current.onFailure("dropped", s);
+            teardown();
+            move("failed");
+            return;
+          }
+          if (s === "disconnected") {
+            /*
+             * A blip, usually. WebRTC reports "disconnected" for a lost packet
+             * run and then heals itself a second later, so ending the call on
+             * the first one hangs up on people who never lost the thread.
+             */
+            dropTimer.current = setTimeout(() => {
+              if (stopped.current) return;
+              if (connection.connectionState === "connected") return;
+              h.current.onFailure("dropped", connection.connectionState);
               teardown();
               move("failed");
-            }
+            }, 5000);
           }
         };
 

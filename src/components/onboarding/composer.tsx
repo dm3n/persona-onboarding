@@ -93,20 +93,23 @@ export function Composer({
               render={
                 <Button
                   type="button"
-                  size="icon"
-                  variant="ghost"
+                  variant="secondary"
                   aria-label="Talk instead of typing"
                   className={cn(
-                    "size-9 rounded-full border border-border text-foreground/80",
-                    "hover:border-foreground/30 hover:bg-accent hover:text-foreground",
-                    // Voice is the point. When the box is empty it is the
-                    // brighter of the two things you can do.
-                    !value.trim() && "border-foreground/25",
+                    // Voice is the main way in, so it is a button you can
+                    // actually see rather than a hairline circle.
+                    "h-9 gap-1.5 rounded-full px-3 font-medium",
+                    "bg-foreground/[0.07] text-foreground hover:bg-foreground/[0.12]",
+                    variant === "call" &&
+                      "bg-white/15 text-white hover:bg-white/25",
                   )}
                   onClick={onCall}
                   disabled={disabled}
                 >
                   <Mic className="size-4" />
+                  <span className="hidden text-[0.8125rem] sm:inline">
+                    Talk
+                  </span>
                 </Button>
               }
             />

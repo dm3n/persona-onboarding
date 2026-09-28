@@ -144,6 +144,7 @@ export function useOnboarding() {
   const stagesShownRef = useRef<Set<StageId>>(new Set());
   const turnSeq = useRef(0);
   const liveAgentId = useRef<string | null>(null);
+  const liveUserId = useRef<string | null>(null);
   const deadAir = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const setProfile = useCallback(
@@ -352,12 +353,48 @@ export function useOnboarding() {
   }, []);
 
   const realtime = useRealtimeCall({
+    /*
+     * Your own words, appearing as you say them.
+     *
+     * Reading yourself back in real time is most of what makes a voice
+     * interface feel like it is listening rather than recording.
+     */
+    onUserStarted: useCallback(() => {
+      armDeadAir();
+      if (liveUserId.current) return;
+      liveUserId.current = pushMessage({
+        role: "user",
+        kind: "text",
+        text: "",
+        viaVoice: true,
+        pending: true,
+      });
+    }, [armDeadAir, pushMessage]),
+
+    onUserPartial: useCallback(
+      (text) => {
+        if (!text || !liveUserId.current) return;
+        armDeadAir();
+        patchMessage(liveUserId.current, { text, pending: true });
+      },
+      [armDeadAir, patchMessage],
+    ),
+
     onUserSaid: useCallback(
       (text) => {
         armDeadAir();
-        pushMessage({ role: "user", kind: "text", text, viaVoice: true });
+        const id = liveUserId.current;
+        liveUserId.current = null;
+        if (id) {
+          if (text.trim()) patchMessage(id, { text, pending: false });
+          // A false start with nothing in it should not leave a bubble.
+          else setMessages((prev) => prev.filter((m) => m.id !== id));
+          return;
+        }
+        if (text.trim())
+          pushMessage({ role: "user", kind: "text", text, viaVoice: true });
       },
-      [armDeadAir, pushMessage],
+      [armDeadAir, patchMessage, pushMessage, setMessages],
     ),
 
     onAgentPartial: useCallback(
@@ -385,16 +422,27 @@ export function useOnboarding() {
         if (liveAgentId.current) {
           patchMessage(liveAgentId.current, { text, pending: false });
           liveAgentId.current = null;
-          return;
+        } else {
+          pushMessage({
+            role: "assistant",
+            kind: "text",
+            text,
+            viaVoice: true,
+          });
         }
-        pushMessage({
-          role: "assistant",
-          kind: "text",
-          text,
-          viaVoice: true,
-        });
+
+        /*
+         * The same guarantees the text channel gets.
+         *
+         * A voice agent will happily say it is putting a button on your screen
+         * and then not call the tool that does it. What is on screen is the
+         * state machine's job, not something to be narrated on trust.
+         */
+        const open = nextSlot(profileRef.current);
+        if (open === "gmail") showGmailCard();
+        else if (open === "need") showStage("focus");
       },
-      [armDeadAir, patchMessage, pushMessage],
+      [armDeadAir, patchMessage, pushMessage, showGmailCard, showStage],
     ),
 
     onTool: useCallback(
@@ -709,6 +757,7 @@ export function useOnboarding() {
       if (deadAir.current) clearTimeout(deadAir.current);
       realtime.stop();
       liveAgentId.current = null;
+      liveUserId.current = null;
 
       const secs = c.startedAt
         ? Math.round((Date.now() - c.startedAt) / 1000)
@@ -759,6 +808,7 @@ export function useOnboarding() {
     gmailShownRef.current = false;
     stagesShownRef.current = new Set();
     liveAgentId.current = null;
+    liveUserId.current = null;
     persist.clear();
     setCall(IDLE_CALL);
     setProfile({ ...newProfile(), phase: "chat" });
