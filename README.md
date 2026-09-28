@@ -43,7 +43,15 @@ in any order.
 The voice agent has the same tools the text agent has, so both channels collect
 into the same contract and neither can take a shortcut the other cannot. What it
 hears goes through the same validation too, which is why saying "call me" out
-loud does not end up as your name.
+loud does not end up as your name. And what ends up on your screen is the state
+machine's decision, not something the agent is trusted to have done: a voice
+agent will cheerfully tell you it has put a button in front of you and then not
+call the tool that does it.
+
+Your own words appear as you say them. Transcription runs alongside the model
+rather than ahead of it, so a turn claims its place in the transcript the moment
+you start talking and fills in from there, which keeps what you said above the
+answer to it.
 
 Turn taking is semantic rather than gap-based, so it waits for a finished
 thought instead of cutting in at the first pause, and it stops the moment you
@@ -160,12 +168,17 @@ onboarding carries on typing.
 
 ```bash
 pnpm test:e2e                  # the full matrix above, against localhost
-VOICE_LIVE=1 pnpm test:e2e     # also place one real call, which costs real credit
+VOICE_LIVE=1 pnpm test:e2e     # also place real calls, which cost real credit
 node e2e/stress.cjs voiceRing  # one scenario
 BASE=https://... pnpm test:e2e # against a deployment
 pnpm check:slots               # the normalisers, against their awkward cases
 pnpm typecheck && pnpm lint
 ```
+
+The voice tests speak to it for real: the lines are generated with text to
+speech, stitched together with pauses, and played into the page as the
+microphone, then the four fields are checked at the other end. Nothing binary is
+committed; the audio is built on demand and cached.
 
 Voice needs WebRTC and a microphone, which is every current browser. Where it is
 unavailable or refused, the onboarding says so and finishes in text, which is a

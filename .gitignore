@@ -42,3 +42,5 @@ next-env.d.ts
 
 # e2e artefacts
 e2e/shots/
+
+e2e/.cache/

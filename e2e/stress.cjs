@@ -130,7 +130,61 @@ const scenarios = {
     await browser.close();
   },
 
-  /* 5. A real call. Opt in with VOICE_LIVE=1, it spends real credit. */
+  /* 5a. A real spoken conversation. Opt in with VOICE_LIVE=1. */
+  async voiceSpoken() {
+    if (!process.env.VOICE_LIVE) {
+      console.log('  skipped (set VOICE_LIVE=1 to speak to it for real)');
+      return;
+    }
+    const { browser, page, errors } = await open({
+      speaks: [
+        "Let's call you Ada.",
+        'My name is Daniel.',
+        'I need help staying on top of investor follow ups.',
+      ],
+    });
+    await page.waitForTimeout(800);
+    await page.getByRole('button', { name: /Talk instead of typing/i }).click();
+    await page.waitForTimeout(400);
+    await page.getByRole('button', { name: 'Answer', exact: true }).click();
+
+    // The track runs about seventy seconds, plus room for the last reply.
+    for (let i = 0; i < 17; i++) {
+      await page.waitForTimeout(6000);
+      const t = await transcript(page);
+      if (t?.profile.slots.need.value) break;
+    }
+
+    const t = await transcript(page);
+    const s = t.profile.slots;
+    await dump(page, 'spoken to it');
+    check('voiceSpoken: heard the agent name', s.agentName.value === 'Ada', String(s.agentName.value));
+    check('voiceSpoken: heard their name', s.userName.value === 'Daniel', String(s.userName.value));
+    check('voiceSpoken: heard the job', /investor|follow/i.test(s.need.value ?? ''), String(s.need.value));
+    check(
+      'voiceSpoken: puts the Gmail button up rather than asking out loud',
+      t.messages.some((m) => m.includes('[gmail-card]')) || Boolean(s.gmail.value),
+      JSON.stringify(t.messages.slice(-3)),
+    );
+    check(
+      'voiceSpoken: their words land before the reply to them',
+      (() => {
+        // Structural, not wording: the first thing they say has to appear
+        // above the first thing the agent says back.
+        const said = t.messages.findIndex((m) => m.startsWith('user(voice)'));
+        const replied = t.messages.findIndex(
+          (m, i) => i > said && m.startsWith('assistant(voice)'),
+        );
+        return said >= 0 && replied > said;
+      })(),
+      JSON.stringify(t.messages.slice(0, 5)),
+    );
+    check('voiceSpoken: no errors', errors.filter((e) => !e.includes('hydrated')).length === 0, errors.join('|').slice(0, 200));
+    await shot(page, 's11-voice-spoken');
+    await browser.close();
+  },
+
+  /* 5b. A real call. Opt in with VOICE_LIVE=1, it spends real credit. */
   async voiceLive() {
     if (!process.env.VOICE_LIVE) {
       console.log('  skipped (set VOICE_LIVE=1 to run a real call)');
