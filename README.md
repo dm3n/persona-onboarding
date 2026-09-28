@@ -27,6 +27,28 @@ speaks, listens, hears you, and reacts. It just does not dial a phone number.
 **Nobody answers a question twice.** Anything you have given survives a hangup, a
 refusal, a reload, and a browser with no microphone.
 
+## The panels
+
+Two moments are too good to leave as plain text, so the agent drops a small
+interactive panel into the conversation instead. Each one follows the same
+grammar: the agent does something first, then hands over, and a bar underneath
+tracks what is left.
+
+**Naming.** The agent is in the box, unsettled and unnamed. Tap a name and it
+settles into it, with a verdict line to close the moment.
+
+**The job board.** Six kinds of work. The agent takes one itself, then hands
+over: tap whichever others actually eat your week, up to three, and a counter
+runs down. What you pick becomes the job it starts on.
+
+Tapping is just another way of replying. Whatever you choose is turned back into
+an ordinary message, so the agent reacts the same way and the transcript reads
+the same whether you tapped or typed. Answer by typing instead and the panel
+settles itself rather than sitting there still wanting a tap.
+
+Both are decided by the server before the turn runs, the same way the call offer
+is, so the agent's words and the panel on screen can never disagree.
+
 ## Flow
 
 ```
@@ -75,6 +97,8 @@ src/
     rescue.ts             second pass when a turn captured nothing
     scrub.ts              house style enforced on the way out
     use-onboarding.ts     the client state machine and call loop
+  components/onboarding/
+    agent-stage.tsx       the interactive panels
   lib/speech/             Web Speech, defensively wrapped
 ```
 

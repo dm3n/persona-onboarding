@@ -32,8 +32,17 @@ export function buildSystemPrompt(opts: {
   intent?: UserIntent;
   /** The server has decided this is the turn to offer the call. */
   offerCallNow?: boolean;
+  /** The job board is going on screen this turn. */
+  showFocusBoard?: boolean;
 }): string {
-  const { profile: p, channel, event, intent, offerCallNow } = opts;
+  const {
+    profile: p,
+    channel,
+    event,
+    intent,
+    offerCallNow,
+    showFocusBoard,
+  } = opts;
   const agent = p.slots.agentName.value;
   const user = p.slots.userName.value;
   const missing = missingSlots(p);
@@ -93,9 +102,13 @@ ${missing.length ? missing.map((m) => `- ${m}`).join("\n") : "- Nothing. You hav
 ${
   offerCallNow
     ? "Ignore that list for this one message. Your only job this turn is the call offer below."
-    : next
-      ? `The one to steer toward next is: ${next}.`
-      : ""
+    : showFocusBoard
+      ? `IGNORE THAT LIST. A board is going up on their screen as you write. It carries common jobs, you take one of them yourself, and they tap whichever others eat their week.
+Write one short line putting it in front of them. Nothing else.
+Do not list the jobs, you cannot see them. Do not ask a second question. Do not write the words Gmail, email or connect: access comes after you know what the work is.`
+      : next
+        ? `Ask for exactly one thing in this message: ${next}. Nothing else is open to you yet.`
+        : ""
 }
 ${askCounts.length ? `You have already asked twice for: ${askCounts.join(", ")}. Do not ask a third time. Offer to move on and come back to it later.` : ""}
 
@@ -174,7 +187,7 @@ function intentLine(
   }
   if (intent.refusesCall) {
     lines.push(
-      "They do not want a call. Accept it in a few words, never offer again, and keep going in text.",
+      "They are turning down the call. That is a choice about how you talk, not an answer to your question, so do not treat their words as the answer. Accept it in a few words, never offer a call again, and ask your open question again in plain terms.",
     );
   }
   if (intent.wantsSkip) {

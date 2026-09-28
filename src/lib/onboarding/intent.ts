@@ -77,6 +77,30 @@ export function slotInMessage(text: string): SlotId | null {
   return null;
 }
 
+const MENTIONS: Record<SlotId, RegExp> = {
+  agentName: /\b(?:call me|name me|my name)\b/i,
+  userName: /\b(?:call you|your name|go by)\b/i,
+  // "inbox" is left out on purpose: it turns up constantly in need-talk
+  // ("my inbox is a disaster") and reading it as an email question is wrong.
+  gmail: /\b(?:g[\s-]?mail|email|e-mail|connect|address)\b|@/i,
+  need: /\b(?:help with|off your plate|take on|start with|first job|working on|hand(?:ed)? (?:me|off))\b/i,
+};
+
+/** Whether a reply already deals with a slot, however it is phrased. */
+export function mentionsSlot(text: string, slot: SlotId): boolean {
+  return MENTIONS[slot].test(text || "");
+}
+
+/**
+ * Narrowly, is this reply asking for the email account?
+ *
+ * Used where a false positive costs a whole interaction, so it will not fire
+ * on "connect" or "address" the way the looser check above does.
+ */
+export function asksForEmail(text: string): boolean {
+  return /\b(?:g[\s-]?mail|e-?mail)\b|@/i.test(text || "");
+}
+
 /**
  * Last-resort extraction for when a model turn fails entirely. Deliberately
  * conservative: it only fires on unambiguous shapes.

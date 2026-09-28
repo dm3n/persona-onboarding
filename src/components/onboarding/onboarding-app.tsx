@@ -7,6 +7,7 @@ import { PersonaLogo } from "@/components/persona-logo";
 import { CallOverlay } from "@/components/onboarding/call-overlay";
 import { Composer } from "@/components/onboarding/composer";
 import { GmailCard, GmailDialog } from "@/components/onboarding/gmail-connect";
+import { AgentStage } from "@/components/onboarding/agent-stage";
 import {
   AssistantMessage,
   CallSummaryMessage,
@@ -16,6 +17,7 @@ import { ReadyScreen } from "@/components/onboarding/ready-screen";
 import { SetupProgress } from "@/components/onboarding/setup-progress";
 import { useOnboarding } from "@/lib/onboarding/use-onboarding";
 import { displayAgentName } from "@/lib/onboarding/slots";
+import type { StageId } from "@/lib/onboarding/types";
 import { cn } from "@/lib/utils";
 
 export function OnboardingApp() {
@@ -100,6 +102,22 @@ export function OnboardingApp() {
                 {o.messages.map((m) => {
                   if (m.kind === "call-summary")
                     return <CallSummaryMessage key={m.id} message={m} />;
+                  if (m.kind === "stage") {
+                    const stageId = (m.data as { stageId?: StageId })?.stageId;
+                    const slot = stageId === "name" ? "agentName" : "need";
+                    return (
+                      <AgentStage
+                        key={m.id}
+                        message={m}
+                        agentName={agentName}
+                        answeredElsewhere={Boolean(
+                          o.profile.slots[slot].value ||
+                          o.profile.slots[slot].declined,
+                        )}
+                        onComplete={o.completeStage}
+                      />
+                    );
+                  }
                   if (m.kind === "gmail-card")
                     return (
                       <GmailCard

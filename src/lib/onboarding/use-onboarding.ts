@@ -23,7 +23,7 @@ import {
 import { runTurn } from "./client";
 import { readIntent } from "./intent";
 import * as persist from "./persist";
-import { OPENING_MESSAGE, OPENING_SUGGESTIONS } from "./prompt";
+import { OPENING_MESSAGE } from "./prompt";
 import {
   callSummary,
   canGraduate,
@@ -37,6 +37,7 @@ import type {
   Message,
   Profile,
   SlotId,
+  StageId,
   TurnAction,
   TurnEvent,
 } from "./types";
@@ -98,15 +99,26 @@ type LateBound = {
 
 function noop() {}
 
-function openingMessage(): Message {
-  return {
-    id: uid(),
-    role: "assistant",
-    kind: "text",
-    text: OPENING_MESSAGE,
-    at: Date.now(),
-    suggestions: OPENING_SUGGESTIONS,
-  };
+/** The opening: a line, then the agent itself, waiting to be named. */
+function openingMessages(): Message[] {
+  const at = Date.now();
+  return [
+    {
+      id: uid(),
+      role: "assistant",
+      kind: "text",
+      text: OPENING_MESSAGE,
+      at,
+    },
+    {
+      id: uid(),
+      role: "assistant",
+      kind: "stage",
+      text: "",
+      at: at + 1,
+      data: { stageId: "name", status: "active" },
+    },
+  ];
 }
 
 export function useOnboarding() {
@@ -138,6 +150,7 @@ export function useOnboarding() {
   const silenceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hiddenSinceRef = useRef<number | null>(null);
   const gmailShownRef = useRef(false);
+  const stagesShownRef = useRef<Set<StageId>>(new Set());
   const speechQueue = useRef<{ text: string; last: boolean }[]>([]);
   const speakingRef = useRef(false);
   const turnSeq = useRef(0);
@@ -203,8 +216,12 @@ export function useOnboarding() {
       gmailShownRef.current = saved.messages.some(
         (m) => m.kind === "gmail-card",
       );
+      for (const m of saved.messages) {
+        const id = (m.data as { stageId?: StageId } | undefined)?.stageId;
+        if (id) stagesShownRef.current.add(id);
+      }
     } else {
-      setMessages([openingMessage()]);
+      setMessages(openingMessages());
     }
     // localStorage is not readable during render, so the one place this hook
     // sets state from an effect is the restore on mount.
@@ -330,6 +347,22 @@ export function useOnboarding() {
           case "end_call":
             setTimeout(() => fns.current.endCall("completed"), 1200);
             break;
+          case "stage": {
+            if (stagesShownRef.current.has(action.stage)) break;
+            stagesShownRef.current.add(action.stage);
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: uid(),
+                role: "assistant",
+                kind: "stage",
+                text: "",
+                at: Date.now(),
+                data: { stageId: action.stage, status: "active" },
+              },
+            ]);
+            break;
+          }
           case "gmail_connect": {
             if (gmailShownRef.current) break;
             gmailShownRef.current = true;
@@ -465,6 +498,19 @@ export function useOnboarding() {
               }
               return { ...prev, slots: next };
             });
+          },
+          onAsked(slot) {
+            if (turnSeq.current !== seq) return;
+            setProfile((prev) => ({
+              ...prev,
+              slots: {
+                ...prev.slots,
+                [slot]: {
+                  ...prev.slots[slot],
+                  asks: Math.min(prev.slots[slot].asks + 1, 9),
+                },
+              },
+            }));
           },
           onAction(action) {
             actions.push(action);
@@ -768,7 +814,7 @@ export function useOnboarding() {
     persist.clear();
     setCall(IDLE_CALL);
     setProfile({ ...newProfile(), phase: "chat" });
-    setMessages([openingMessage()]);
+    setMessages(openingMessages());
     markBusy(false);
   }, [clearSilence, markBusy, setCall, setMessages, setProfile, stopSpeech]);
 
@@ -804,6 +850,26 @@ export function useOnboarding() {
       void runTurnFor({ channel: "chat", history });
     },
     [applyLocalIntent, heard, reset, runTurnFor, setMessages],
+  );
+
+  /**
+   * A finished stage becomes a reply.
+   *
+   * Tapping a name is the same as typing it, so the agent reacts the same way
+   * and the transcript reads the same either way.
+   */
+  const completeStage = useCallback(
+    (messageId: string, result: string) => {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === messageId
+            ? { ...m, data: { ...(m.data ?? {}), status: "done", result } }
+            : m,
+        ),
+      );
+      send(result);
+    },
+    [send, setMessages],
   );
 
   const connectGmail = useCallback(
@@ -958,5 +1024,6 @@ export function useOnboarding() {
     dismissGmail,
     graduate,
     reset,
+    completeStage,
   };
 }

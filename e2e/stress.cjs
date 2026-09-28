@@ -315,7 +315,79 @@ const scenarios = {
     await browser.close();
   },
 
-  /* 14. Opening the Gmail sheet and walking away from it. */
+  /* 14. The naming panel, tapped rather than typed. */
+  async stageName() {
+    const { browser, page, errors } = await open();
+    await page.waitForTimeout(2600);
+    const board = page.locator('[data-stage="name"]');
+    check('stageName: panel is there from the start', (await board.count()) > 0);
+    await page.getByRole('button', { name: 'Ada', exact: true }).click();
+    await settle(page);
+    const t = await transcript(page);
+    check('stageName: tapping names the agent', t.profile.slots.agentName.value === 'Ada', String(t.profile.slots.agentName.value));
+    check('stageName: reads as a reply', t.messages.some((m) => m.startsWith('user: Ada')), JSON.stringify(t.messages.slice(0, 4)));
+    check('stageName: panel settles', (await page.locator('[data-stage="name"][data-settled="true"]').count()) > 0);
+    check('stageName: no errors', errors.filter((e) => !e.includes('hydrated')).length === 0, errors.join('|').slice(0, 200));
+    await browser.close();
+  },
+
+  /* 15. Typing a name while the panel is open must not strand it. */
+  async stageTyped() {
+    const { browser, page } = await open();
+    await page.waitForTimeout(2200);
+    await type(page, 'Wren');
+    await settle(page);
+    check('stageTyped: panel settles anyway', (await page.locator('[data-stage="name"][data-settled="true"]').count()) > 0);
+    const t = await transcript(page);
+    check('stageTyped: name still captured', t.profile.slots.agentName.value === 'Wren', String(t.profile.slots.agentName.value));
+    await browser.close();
+  },
+
+  /* 16. The focus board collects the job. */
+  async stageFocus() {
+    const { browser, page, errors } = await open();
+    await page.waitForTimeout(2400);
+    await page.getByRole('button', { name: 'Scout', exact: true }).click();
+    await settle(page);
+    await type(page, "I'm Daniel");
+    await settle(page);
+    await type(page, "let's just type");
+    await settle(page);
+    await page.waitForTimeout(2600);
+
+    await dump(page, 'before the board');
+    const board = page.locator('[data-stage="focus"]');
+    check('stageFocus: board appears', (await board.count()) > 0);
+    await shot(page, 's8-focus-board');
+    for (const label of ['Follow ups', 'Scheduling']) {
+      const b = page.getByRole('button', { name: new RegExp(label, 'i') });
+      if (await b.count()) await b.first().click();
+      await page.waitForTimeout(250);
+    }
+    await page.getByRole('button', { name: 'Done', exact: true }).click();
+    await settle(page);
+    const t = await transcript(page);
+    check('stageFocus: picks become the job', Boolean(t.profile.slots.need.value && /follow ups|scheduling|inbox/i.test(t.profile.slots.need.value)), String(t.profile.slots.need.value));
+    check('stageFocus: board settles', (await page.locator('[data-stage="focus"][data-settled="true"]').count()) > 0);
+    check('stageFocus: no errors', errors.filter((e) => !e.includes('hydrated')).length === 0, errors.join('|').slice(0, 200));
+    await browser.close();
+  },
+
+  /* 17. Panels survive a reload. */
+  async stageReload() {
+    const { browser, page } = await open();
+    await page.waitForTimeout(2400);
+    await page.getByRole('button', { name: 'Goose', exact: true }).click();
+    await settle(page);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('[data-hydrated="true"]');
+    await page.waitForTimeout(800);
+    check('stageReload: panel restores settled', (await page.locator('[data-stage="name"][data-settled="true"]').count()) > 0);
+    check('stageReload: not re-offered', (await page.locator('[data-stage="name"]').count()) === 1);
+    await browser.close();
+  },
+
+  /* 18. Opening the Gmail sheet and walking away from it. */
   async gmailDismiss() {
     const { browser, page } = await open();
     await type(page, 'Ada');
