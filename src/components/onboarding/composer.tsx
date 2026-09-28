@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, Phone } from "lucide-react";
+import { ArrowUp, Mic } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -95,16 +95,22 @@ export function Composer({
                   type="button"
                   size="icon"
                   variant="ghost"
-                  aria-label="Ask for a call instead"
-                  className="size-9 rounded-full text-muted-foreground hover:text-foreground"
+                  aria-label="Talk instead of typing"
+                  className={cn(
+                    "size-9 rounded-full border border-border text-foreground/80",
+                    "hover:border-foreground/30 hover:bg-accent hover:text-foreground",
+                    // Voice is the point. When the box is empty it is the
+                    // brighter of the two things you can do.
+                    !value.trim() && "border-foreground/25",
+                  )}
                   onClick={onCall}
                   disabled={disabled}
                 >
-                  <Phone className="size-4" />
+                  <Mic className="size-4" />
                 </Button>
               }
             />
-            <TooltipContent side="top">Talk instead of typing</TooltipContent>
+            <TooltipContent side="top">Talk to it</TooltipContent>
           </Tooltip>
         ) : null}
         <Button

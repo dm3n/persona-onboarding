@@ -57,127 +57,110 @@ const scenarios = {
     await browser.close();
   },
 
-  /* 2. A full call, answered and completed by voice. */
-  async call() {
+  /* 2. Asking for a call rings, without taking the screen away. */
+  async voiceRing() {
     const { browser, page, errors } = await open();
-    await type(page, 'Ada');
+    await page.waitForTimeout(2400);
+    await page.getByRole('button', { name: 'Ada', exact: true }).click();
     await settle(page);
     await type(page, 'call me');
     await settle(page);
+
     let st = await state(page);
-    check('call: phone rings', st.call === 'ringing', JSON.stringify(st));
-    await shot(page, 's2-ringing');
+    check('voiceRing: it rings', st.call === 'ringing', JSON.stringify(st));
+    check('voiceRing: the conversation is still there', (await page.locator('[data-stage]').count()) > 0);
+    check('voiceRing: you can still type', await page.locator('textarea').first().isEnabled());
+    await shot(page, 's9-ringing-inline');
 
-    await page.getByRole('button', { name: 'Answer' }).click({ force: true });
+    await page.getByRole('button', { name: 'Not now', exact: true }).click();
     await settle(page);
     st = await state(page);
-    check('call: connected', st.call === 'live', JSON.stringify(st));
-    check('call: agent spoke first', (await page.evaluate(() => window.__speech.spoken.length)) > 0);
-    check('call: mic opened after speaking', await page.evaluate(() => window.__micLive()));
-    await shot(page, 's3-call-live');
-
-    await page.evaluate(() => window.__say('My name is Daniel'));
-    await settle(page);
-    await page.evaluate(() => window.__say('I want help clearing my inbox every morning'));
-    await settle(page);
-    await dump(page, 'mid call');
-    st = await state(page);
-    check('call: name and need captured by voice', st.collected >= 3, JSON.stringify(st));
-
-    await page.getByRole('button', { name: 'End call' }).click({ force: true });
-    await settle(page);
-    await dump(page, 'after hangup');
-    st = await state(page);
-    check('call: back in chat', st.call === 'idle' && st.phase !== 'call', JSON.stringify(st));
-    check('call: nothing lost on hangup', st.collected >= 3, JSON.stringify(st));
-    check('call: no errors', errors.filter((e) => !e.includes('hydrated')).length === 0, errors.join('|').slice(0, 300));
-    await shot(page, 's4-after-call');
-    await browser.close();
-  },
-
-  /* 3. Hang up two seconds in, before answering anything. */
-  async hangup() {
-    const { browser, page, errors } = await open();
-    await type(page, 'Scout');
-    await settle(page);
-    await type(page, 'call me');
-    await settle(page);
-    await page.getByRole('button', { name: 'Answer' }).click({ force: true });
-    await page.waitForTimeout(1500);
-    await page.getByRole('button', { name: 'End call' }).click({ force: true });
-    await settle(page);
-    await dump(page, 'hung up early');
-    const st = await state(page);
+    check('voiceRing: declining lands back in text', st.call === 'idle', JSON.stringify(st));
     const t = await transcript(page);
-    const last = t.messages[t.messages.length - 1] || '';
-    check('hangup: returns to chat', st.call === 'idle', JSON.stringify(st));
-    check('hangup: agent follows up in text', last.startsWith('assistant'), last.slice(0, 80));
-    check('hangup: keeps the agent name', t.profile.slots.agentName.value === 'Scout', String(t.profile.slots.agentName.value));
-    check('hangup: no errors', errors.filter((e) => !e.includes('hydrated')).length === 0, errors.join('|').slice(0, 200));
+    check('voiceRing: agent carries on', t.messages[t.messages.length - 1].startsWith('assistant'), t.messages[t.messages.length - 1].slice(0, 80));
+    check('voiceRing: no errors', errors.filter((e) => !e.includes('hydrated')).length === 0, errors.join('|').slice(0, 200));
     await browser.close();
   },
 
-  /* 4. Decline the call outright. */
-  async decline() {
-    const { browser, page } = await open();
-    await type(page, 'Ada');
+  /* 3. Voice is unavailable. The onboarding must not stall. */
+  async voiceUnavailable() {
+    const { browser, page, errors } = await open({ breakVoice: true });
+    await page.waitForTimeout(2400);
+    await page.getByRole('button', { name: 'Ada', exact: true }).click();
     await settle(page);
     await type(page, 'call me');
     await settle(page);
-    await page.getByRole('button', { name: 'Decline' }).click({ force: true });
+    await page.getByRole('button', { name: 'Answer', exact: true }).click();
+    await page.waitForTimeout(2500);
     await settle(page);
-    await dump(page, 'declined');
-    const st = await state(page);
-    const t = await transcript(page);
-    check('decline: back to chat', st.call === 'idle', JSON.stringify(st));
-    check('decline: conversation continues', t.messages[t.messages.length - 1].startsWith('assistant'));
-    await browser.close();
-  },
 
-  /* 5. No speech support at all, the Firefox case. */
-  async nospeech() {
-    const { browser, page, errors } = await open({ speech: 'none' });
-    await type(page, 'Ada');
-    await settle(page);
-    await type(page, 'call me');
-    await settle(page);
-    await page.getByRole('button', { name: 'Answer' }).click({ force: true });
-    await settle(page);
     const st = await state(page);
-    check('nospeech: call still connects', st.call === 'live', JSON.stringify(st));
+    check('voiceUnavailable: does not hang in connecting', st.call === 'idle', JSON.stringify(st));
     const body = await page.evaluate(() => document.body.innerText);
-    check('nospeech: tells the user why', /type your answer/i.test(body), body.slice(0, 300));
-    const callBox = page.locator('[role=dialog] textarea');
-    check('nospeech: offers a text box inside the call', (await callBox.count()) > 0);
-    await shot(page, 's5-call-nomic');
-    // And it must still be usable.
-    await callBox.first().fill('Daniel');
-    await callBox.first().press('Enter');
+    check('voiceUnavailable: says so', /not available|could not connect|keep typing|carrying on/i.test(body), body.slice(-240));
+    await dump(page, 'after a failed call');
+    await type(page, "I'm Daniel");
     await settle(page);
-    await dump(page, 'typed on the call');
-    check('nospeech: captured a typed answer', (await state(page)).collected >= 2, JSON.stringify(await state(page)));
-    check('nospeech: no errors', errors.filter((e) => !e.includes('hydrated')).length === 0, errors.join('|').slice(0, 300));
+    check('voiceUnavailable: text still collects', (await state(page)).collected >= 2, JSON.stringify(await state(page)));
+    // The 503 is this scenario's whole point, so it is not a defect here.
+    const unexpected = errors.filter(
+      (e) => !e.includes('hydrated') && !e.includes('503'),
+    );
+    check('voiceUnavailable: nothing else broke', unexpected.length === 0, unexpected.join('|').slice(0, 200));
     await browser.close();
   },
 
-  /* 6. Dead air. */
-  async silence() {
-    const { browser, page } = await open();
-    await type(page, 'Ada');
+  /* 4. Microphone blocked. */
+  async voiceMicDenied() {
+    const { browser, page, errors } = await open({ mic: 'denied' });
+    await page.waitForTimeout(2400);
+    await page.getByRole('button', { name: 'Ada', exact: true }).click();
     await settle(page);
     await type(page, 'call me');
     await settle(page);
-    await page.getByRole('button', { name: 'Answer' }).click({ force: true });
+    await page.getByRole('button', { name: 'Answer', exact: true }).click();
+    await page.waitForTimeout(4000);
     await settle(page);
-    const before = await page.evaluate(() => window.__speech.spoken.length);
-    await page.waitForTimeout(9500);
-    await settle(page);
-    const after = await page.evaluate(() => window.__speech.spoken.length);
-    check('silence: agent checks in', after > before, `${before} -> ${after}`);
-    await page.waitForTimeout(19000);
+
     const st = await state(page);
-    check('silence: call eventually ends itself', st.call === 'idle', JSON.stringify(st));
-    await dump(page, 'after silent call');
+    check('voiceMicDenied: falls back to text', st.call === 'idle', JSON.stringify(st));
+    const body = await page.evaluate(() => document.body.innerText);
+    check('voiceMicDenied: explains why', /mic|microphone/i.test(body), body.slice(-240));
+    check('voiceMicDenied: no errors', errors.filter((e) => !e.includes('hydrated')).length === 0, errors.join('|').slice(0, 200));
+    await browser.close();
+  },
+
+  /* 5. A real call. Opt in with VOICE_LIVE=1, it spends real credit. */
+  async voiceLive() {
+    if (!process.env.VOICE_LIVE) {
+      console.log('  skipped (set VOICE_LIVE=1 to run a real call)');
+      return;
+    }
+    const { browser, page, errors } = await open();
+    await page.waitForTimeout(2200);
+    await page.getByRole('button', { name: /Talk instead of typing/i }).click();
+    await page.waitForTimeout(500);
+    await page.getByRole('button', { name: 'Answer', exact: true }).click();
+
+    let live = false;
+    for (let i = 0; i < 30; i++) {
+      if ((await state(page)).call === 'live') { live = true; break; }
+      await page.waitForTimeout(500);
+    }
+    check('voiceLive: connects', live, JSON.stringify(await state(page)));
+    await page.waitForTimeout(8000);
+
+    const t = await transcript(page);
+    check('voiceLive: the agent opens the call', t.messages.some((m) => m.startsWith('assistant(voice)')), JSON.stringify(t.messages.slice(-2)));
+    check('voiceLive: the panel is still on screen', (await page.locator('[data-stage="name"]').count()) > 0);
+    check('voiceLive: you can still type', await page.locator('textarea').first().isEnabled());
+    await shot(page, 's10-voice-live');
+
+    await page.getByRole('button', { name: 'End call', exact: true }).click();
+    await settle(page);
+    const st = await state(page);
+    check('voiceLive: hanging up returns to text', st.call === 'idle' && st.phase !== 'call', JSON.stringify(st));
+    check('voiceLive: no errors', errors.filter((e) => !e.includes('hydrated')).length === 0, errors.join('|').slice(0, 300));
     await browser.close();
   },
 
