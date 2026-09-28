@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { AnimatePresence } from "motion/react";
 
 import { PersonaLogo } from "@/components/persona-logo";
-import { CallOverlay } from "@/components/onboarding/call-overlay";
+import { IncomingCall, VoiceBar } from "@/components/onboarding/voice-bar";
 import { Composer } from "@/components/onboarding/composer";
 import { GmailCard, GmailDialog } from "@/components/onboarding/gmail-connect";
 import { AgentStage } from "@/components/onboarding/agent-stage";
@@ -48,7 +48,7 @@ export function OnboardingApp() {
     .find((m) => m.role === "assistant" && m.kind === "text")?.id;
 
   const agentName = displayAgentName(o.profile);
-  const inCall = o.call.status !== "idle";
+  const inCall = o.call.status === "live" || o.call.status === "connecting";
   const ready = o.profile.phase === "ready";
 
   const placeholder = !o.profile.slots.agentName.value
@@ -129,7 +129,6 @@ export function OnboardingApp() {
                     );
                   if (m.role === "user")
                     return <UserMessage key={m.id} message={m} />;
-                  if (m.viaVoice && inCall) return null;
                   return (
                     <AssistantMessage
                       key={m.id}
@@ -146,38 +145,48 @@ export function OnboardingApp() {
 
           <div className="shrink-0 bg-gradient-to-t from-background via-background to-transparent pb-5 pt-3 sm:pb-7">
             <div className="mx-auto w-full max-w-[40rem] px-5 sm:px-8">
+              <AnimatePresence mode="popLayout">
+                {o.call.status === "ringing" ? (
+                  <div key="ring" className="mb-2.5">
+                    <IncomingCall
+                      agentName={agentName}
+                      onAnswer={o.answerCall}
+                      onDecline={o.declineCall}
+                    />
+                  </div>
+                ) : inCall ? (
+                  <div key="live" className="mb-2.5">
+                    <VoiceBar
+                      call={o.call}
+                      agentName={agentName}
+                      onEnd={() => o.endCall("hungup")}
+                      onToggleMute={o.toggleMute}
+                    />
+                  </div>
+                ) : null}
+              </AnimatePresence>
+
               <Composer
                 onSend={o.send}
                 onCall={o.startCall}
-                showCall={
-                  !o.profile.callRefused &&
-                  Boolean(o.profile.slots.agentName.value)
+                showCall={!o.profile.callRefused && !inCall}
+                placeholder={
+                  inCall ? "Type instead, I'm still listening" : placeholder
                 }
-                disabled={inCall}
-                placeholder={placeholder}
               />
               <p className="mt-2.5 text-center text-[0.6875rem] text-muted-foreground/60">
-                {o.canGraduate && !o.busy
-                  ? "Say the word and I'll get out of your way."
-                  : "A simulated onboarding. Nothing leaves this browser."}
+                {o.call.notice
+                  ? o.call.notice
+                  : inCall
+                    ? "Live voice. Everything on screen still works."
+                    : o.canGraduate && !o.busy
+                      ? "Say the word and I'll get out of your way."
+                      : "A simulated onboarding. Nothing leaves this browser."}
               </p>
             </div>
           </div>
         </main>
       )}
-
-      <CallOverlay
-        call={o.call}
-        profile={o.profile}
-        messages={o.messages}
-        busy={o.busy}
-        onAnswer={o.answerCall}
-        onDecline={o.declineCall}
-        onEnd={() => o.endCall("hungup")}
-        onToggleMute={o.toggleMute}
-        onToggleTextMode={o.toggleTextMode}
-        onSend={o.send}
-      />
 
       <GmailDialog
         open={o.gmailOpen}

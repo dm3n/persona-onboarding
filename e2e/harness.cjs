@@ -16,82 +16,50 @@ const BASE = process.env.BASE || 'http://localhost:3000';
 const OUT = path.join(__dirname, 'shots');
 fs.mkdirSync(OUT, { recursive: true });
 
-/** Fake Web Speech so the real voice path runs in a headless browser. */
-const SPEECH_STUB = `
-(() => {
-  const listeners = {};
-  window.__speech = { spoken: [], utterances: [], rec: null };
+/**
+ * A silent microphone.
+ *
+ * Chrome will fall through to the real input device unless it is handed a
+ * file, and a test run has no business recording anybody's room.
+ */
+const SILENT_MIC = path.join(__dirname, 'silence.wav');
 
-  class FakeRecognition {
-    constructor() { this.lang=''; this.continuous=false; this.interimResults=false; this.maxAlternatives=1;
-      this.onresult=null; this.onerror=null; this.onend=null; this.onstart=null; this.running=false;
-      window.__speech.rec = this; }
-    start() { if (this.running) throw new Error('already started'); this.running = true; setTimeout(()=>this.onstart && this.onstart(), 0); }
-    stop() { if(!this.running) return; this.running=false; setTimeout(()=>this.onend && this.onend(), 0); }
-    abort() { this.running=false; }
-  }
-  window.SpeechRecognition = FakeRecognition;
-  window.webkitSpeechRecognition = FakeRecognition;
+const MEDIA_ARGS = [
+  '--use-fake-ui-for-media-stream',
+  '--use-fake-device-for-media-capture',
+  `--use-file-for-fake-audio-capture=${SILENT_MIC}`,
+  '--autoplay-policy=no-user-gesture-required',
+];
 
-  /** Test hook: pretend the user said something. */
-  window.__say = (text, final = true) => {
-    const rec = window.__speech.rec;
-    if (!rec || !rec.running || !rec.onresult) return false;
-    const result = [{ transcript: text, confidence: 0.95 }];
-    result.isFinal = final;
-    rec.onresult({ resultIndex: 0, results: Object.assign([result], { length: 1 }) });
-    return true;
-  };
-  window.__micLive = () => Boolean(window.__speech.rec && window.__speech.rec.running);
-
-  class FakeUtterance {
-    constructor(text) { this.text = text; this.onstart=null; this.onend=null; this.onerror=null; }
-  }
-  window.SpeechSynthesisUtterance = FakeUtterance;
-  const synth = {
-    speaking: false,
-    getVoices: () => [{ name: 'Samantha', lang: 'en-US', localService: true, default: true }],
-    speak(u) {
-      window.__speech.spoken.push(u.text);
-      synth.speaking = true;
-      setTimeout(() => { u.onstart && u.onstart(); }, 5);
-      // Speak fast so tests do not crawl.
-      setTimeout(() => { synth.speaking = false; u.onend && u.onend(); }, 120);
-    },
-    cancel() { synth.speaking = false; },
-    resume() {},
-    pause() {},
-    addEventListener(){}, removeEventListener(){},
-  };
-  Object.defineProperty(window, 'speechSynthesis', { value: synth, configurable: true });
-
-  navigator.mediaDevices = navigator.mediaDevices || {};
-  navigator.mediaDevices.getUserMedia = async () => ({ getTracks: () => [{ stop(){} }] });
-})();
-`;
-
-/** Removes every speech capability, the Firefox case. */
-const NO_SPEECH_STUB = `
-(() => {
-  delete window.SpeechRecognition;
-  delete window.webkitSpeechRecognition;
-  Object.defineProperty(window, 'speechSynthesis', { value: undefined, configurable: true });
-  navigator.mediaDevices = navigator.mediaDevices || {};
-  navigator.mediaDevices.getUserMedia = async () => { throw new Error('NotAllowedError'); };
-})();
-`;
-
-async function open({ speech = 'fake', colorScheme = 'light', width = 1280, height = 860 } = {}) {
-  const browser = await chromium.launch();
+async function open({
+  colorScheme = 'light',
+  width = 1280,
+  height = 860,
+  /** 'granted' wires a silent mic; 'denied' makes getUserMedia throw. */
+  mic = 'granted',
+  /** Make the token endpoint fail, to exercise the fallback. */
+  breakVoice = false,
+} = {}) {
+  const browser = await chromium.launch({ args: MEDIA_ARGS });
   const ctx = await browser.newContext({
     viewport: { width, height },
     deviceScaleFactor: 2,
     colorScheme,
-    permissions: [],
+    permissions: mic === 'granted' ? ['microphone'] : [],
   });
-  if (speech === 'fake') await ctx.addInitScript(SPEECH_STUB);
-  if (speech === 'none') await ctx.addInitScript(NO_SPEECH_STUB);
+  if (mic === 'denied') {
+    await ctx.addInitScript(`
+      navigator.mediaDevices.getUserMedia = async () => {
+        throw new DOMException('Permission denied', 'NotAllowedError');
+      };
+    `);
+  }
   const page = await ctx.newPage();
+  if (breakVoice) {
+    await page.route('**/api/realtime/token', (route) =>
+      route.fulfill({ status: 503, body: '{"error":"voice_unavailable"}' }),
+    );
+  }
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });

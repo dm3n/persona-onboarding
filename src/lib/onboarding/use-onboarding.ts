@@ -10,15 +10,10 @@ import {
 } from "react";
 
 import {
-  Listener,
-  canListen,
-  canSpeak,
-  primeVoices,
-  speak,
-  splitForSpeech,
-  stopSpeaking,
-  type SpeakHandle,
-} from "@/lib/speech/speech";
+  useRealtimeCall,
+  type RealtimeFailure,
+  type RealtimeStatus,
+} from "@/lib/speech/use-realtime-call";
 
 import { runTurn } from "./client";
 import { readIntent } from "./intent";
@@ -31,6 +26,7 @@ import {
   missingSlots,
   newProfile,
   nextSlot,
+  normalizeSlot,
 } from "./slots";
 import type {
   CallOutcome,
@@ -42,42 +38,62 @@ import type {
   TurnEvent,
 } from "./types";
 
-/** How long the agent waits on a silent line before checking in. */
-const SILENCE_MS = 7500;
 /** Hidden tab for longer than this during a call counts as walking away. */
-const ABANDON_MS = 25_000;
+const ABANDON_MS = 30_000;
 /** Nobody picked up. */
-const RING_MS = 22_000;
+const RING_MS = 20_000;
+/** Dead air in both directions for this long and the call closes itself. */
+const DEAD_AIR_MS = 75_000;
+/**
+ * A hard ceiling on one call.
+ *
+ * Onboarding is meant to take a minute. Anything past five is either someone
+ * exploring or a tab left open, and live audio is metered by the minute.
+ */
+const MAX_CALL_MS = 5 * 60_000;
 
-export type CallStatus = "idle" | "ringing" | "connecting" | "live" | "ended";
+export type CallStatus =
+  "idle" | "ringing" | "connecting" | "live" | "ending" | "failed";
 
 export type CallState = {
   status: CallStatus;
   startedAt: number | null;
   secs: number;
-  agentSpeaking: boolean;
-  listening: boolean;
   muted: boolean;
-  textMode: boolean;
-  micDenied: boolean;
-  partial: string;
+  /** Microphone and speaker levels, 0 to 1, for the orb. */
+  levels: { input: number; output: number };
   notice: string | null;
-  silenceStrikes: number;
 };
 
 const IDLE_CALL: CallState = {
   status: "idle",
   startedAt: null,
   secs: 0,
-  agentSpeaking: false,
-  listening: false,
   muted: false,
-  textMode: false,
-  micDenied: false,
-  partial: "",
+  levels: { input: 0, output: 0 },
   notice: null,
-  silenceStrikes: 0,
 };
+
+const FAILURE_NOTICE: Record<RealtimeFailure, string> = {
+  mic_denied: "Your mic is blocked, so we will keep going here instead.",
+  unsupported: "This browser cannot do live voice, so we will keep typing.",
+  no_token: "Voice is not available right now. Typing works just as well.",
+  network: "The call could not connect. Carrying on here.",
+  dropped: "The call dropped. Picking up where we left off.",
+};
+
+type LateBound = {
+  endCall: (outcome: CallOutcome) => void;
+  startCall: () => void;
+  runTurn: (opts: {
+    channel: "chat" | "voice";
+    event?: TurnEvent;
+    history?: Message[];
+  }) => void;
+  applyActions: (actions: TurnAction[], hasText: boolean) => void;
+};
+
+function noop() {}
 
 function uid() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto)
@@ -85,31 +101,11 @@ function uid() {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-type LateBound = {
-  drain: () => void;
-  handOver: () => void;
-  startCall: () => void;
-  endCall: (outcome: CallOutcome) => void;
-  runTurn: (opts: {
-    channel: "chat" | "voice";
-    event?: TurnEvent;
-    history?: Message[];
-  }) => void;
-};
-
-function noop() {}
-
 /** The opening: a line, then the agent itself, waiting to be named. */
 function openingMessages(): Message[] {
   const at = Date.now();
   return [
-    {
-      id: uid(),
-      role: "assistant",
-      kind: "text",
-      text: OPENING_MESSAGE,
-      at,
-    },
+    { id: uid(), role: "assistant", kind: "text", text: OPENING_MESSAGE, at },
     {
       id: uid(),
       role: "assistant",
@@ -133,11 +129,9 @@ export function useOnboarding() {
   const [hydrated, setHydrated] = useState(false);
 
   /*
-   * Every piece of state has a ref that is written synchronously.
-   *
-   * Turns, speech callbacks and timers all run outside React's render cycle
-   * and need to see the truth immediately. Reading `profile` from a closure
-   * that was created one render ago is how a call ends up talking to itself.
+   * Every piece of state has a ref written synchronously. Turns, call events
+   * and timers all run outside React's render cycle and need the truth now,
+   * not on the next render.
    */
   const profileRef = useRef(profile);
   const messagesRef = useRef(messages);
@@ -145,15 +139,12 @@ export function useOnboarding() {
   const busyRef = useRef(busy);
 
   const abortRef = useRef<AbortController | null>(null);
-  const speakRef = useRef<SpeakHandle | null>(null);
-  const listenerRef = useRef<Listener | null>(null);
-  const silenceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hiddenSinceRef = useRef<number | null>(null);
   const gmailShownRef = useRef(false);
   const stagesShownRef = useRef<Set<StageId>>(new Set());
-  const speechQueue = useRef<{ text: string; last: boolean }[]>([]);
-  const speakingRef = useRef(false);
   const turnSeq = useRef(0);
+  const liveAgentId = useRef<string | null>(null);
+  const deadAir = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const setProfile = useCallback(
     (update: Profile | ((prev: Profile) => Profile)) => {
@@ -199,11 +190,23 @@ export function useOnboarding() {
     setBusy(value);
   }, []);
 
+  const callStatus = useCallback((): CallStatus => callRef.current.status, []);
+  const onCall = useCallback(() => {
+    const s = callRef.current.status;
+    return s === "live" || s === "connecting";
+  }, []);
+
+  /** Late bound, because the call loop is genuinely circular. */
+  const fns = useRef<LateBound>({
+    endCall: noop,
+    startCall: noop,
+    runTurn: noop,
+    applyActions: noop,
+  });
+
   /* -------------------------------------------------------------- *
    * Hydrate and persist
    * -------------------------------------------------------------- */
-  // localStorage cannot be read while rendering on the server, so the restore
-  // has to happen once the client is alive.
   useEffect(() => {
     const saved = persist.load();
     if (saved) {
@@ -227,7 +230,6 @@ export function useOnboarding() {
     // sets state from an effect is the restore on mount.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setHydrated(true);
-    void primeVoices();
   }, [setMessages, setProfile]);
 
   useEffect(() => {
@@ -244,83 +246,251 @@ export function useOnboarding() {
     [setMessages],
   );
 
-  /* -------------------------------------------------------------- *
-   * Speech out
-   * -------------------------------------------------------------- */
-  const clearSilence = useCallback(() => {
-    if (silenceRef.current) clearTimeout(silenceRef.current);
-    silenceRef.current = null;
-  }, []);
-
-  /**
-   * Late bound handles.
-   *
-   * The call loop is genuinely circular: speaking hands over to listening,
-   * listening starts a turn, a turn can end the call, ending the call starts
-   * another turn. Rather than hoist everything into one unreadable function,
-   * the cycle is broken here and closed in an effect below.
-   */
-  const fns = useRef<LateBound>({
-    drain: noop,
-    handOver: noop,
-    startCall: noop,
-    endCall: noop,
-    runTurn: noop,
-  });
-
-  /** Reads through the ref without letting the compiler narrow it. */
-  const callStatus = useCallback((): CallStatus => callRef.current.status, []);
-
-  const drainSpeech = useCallback(() => {
-    if (speakingRef.current) return;
-    const next = speechQueue.current.shift();
-    if (!next) return;
-
-    const finish = () => {
-      speakingRef.current = false;
-      speakRef.current = null;
-      if (speechQueue.current.length) {
-        fns.current.drain();
-        return;
-      }
-      setCall((c) =>
-        c.status === "live" ? { ...c, agentSpeaking: false } : c,
-      );
-      if (next.last) fns.current.handOver();
-    };
-
-    speakingRef.current = true;
-    setCall((c) => (c.status === "live" ? { ...c, agentSpeaking: true } : c));
-
-    if (!canSpeak()) {
-      // No synthesis in this browser. The captions carry the conversation.
-      const readingTime = Math.min(6000, 400 + next.text.length * 45);
-      setTimeout(finish, readingTime);
-      return;
-    }
-    speakRef.current = speak(next.text, { onDone: finish });
-  }, [setCall]);
-
-  const enqueueSpeech = useCallback(
-    (text: string, last: boolean) => {
-      if (callRef.current.status !== "live") return;
-      if (!text.trim()) return;
-      speechQueue.current.push({ text, last });
-      drainSpeech();
+  const pushMessage = useCallback(
+    (m: Omit<Message, "id" | "at"> & Partial<Pick<Message, "id" | "at">>) => {
+      const full: Message = {
+        id: m.id ?? uid(),
+        at: m.at ?? Date.now(),
+        ...m,
+      } as Message;
+      setMessages((prev) => [...prev, full]);
+      return full.id;
     },
-    [drainSpeech],
+    [setMessages],
   );
 
-  const stopSpeech = useCallback(() => {
-    speechQueue.current = [];
-    speakingRef.current = false;
-    speakRef.current?.cancel();
-    speakRef.current = null;
-    stopSpeaking();
-  }, []);
+  /* -------------------------------------------------------------- *
+   * Shared side effects, used by both channels
+   * -------------------------------------------------------------- */
+  const showGmailCard = useCallback(() => {
+    if (gmailShownRef.current) return false;
+    gmailShownRef.current = true;
+    pushMessage({ role: "assistant", kind: "gmail-card", text: "" });
+    return true;
+  }, [pushMessage]);
+
+  const showStage = useCallback(
+    (stage: StageId) => {
+      if (stagesShownRef.current.has(stage)) return false;
+      stagesShownRef.current.add(stage);
+      pushMessage({
+        role: "assistant",
+        kind: "stage",
+        text: "",
+        data: { stageId: stage, status: "active" },
+      });
+      return true;
+    },
+    [pushMessage],
+  );
+
+  const saveSlots = useCallback(
+    (input: Record<string, unknown>) => {
+      const saved: SlotId[] = [];
+      setProfile((prev) => {
+        const slots = { ...prev.slots };
+        const notes = [...prev.notes];
+        for (const id of [
+          "agentName",
+          "userName",
+          "gmail",
+          "need",
+        ] as SlotId[]) {
+          const raw = input[id];
+          if (typeof raw === "string") {
+            // The same cleaning the text channel gets. A voice agent hearing
+            // "call me" as a name would otherwise write it straight in.
+            const asIntent = readIntent(raw);
+            const blocked =
+              asIntent.refusesCall ||
+              asIntent.wantsCall ||
+              asIntent.wantsSkip ||
+              asIntent.refuses ||
+              asIntent.isBareGreeting;
+            const value = blocked ? null : normalizeSlot(id, raw);
+            if (value) {
+              slots[id] = {
+                ...slots[id],
+                value,
+                declined: false,
+                source: "voice",
+              };
+              saved.push(id);
+            }
+          }
+          if (input[`${id}Declined`] === true && !slots[id].value) {
+            slots[id] = { ...slots[id], declined: true };
+          }
+        }
+        if (typeof input.note === "string" && input.note.trim()) {
+          const note = input.note.trim().slice(0, 240);
+          if (!notes.includes(note)) notes.push(note);
+        }
+        return { ...prev, slots, notes: notes.slice(-8) };
+      });
+      return saved;
+    },
+    [setProfile],
+  );
+
+  const graduateNow = useCallback(() => {
+    setProfile((p) =>
+      p.phase === "ready"
+        ? p
+        : { ...p, phase: "ready", finishedAt: Date.now() },
+    );
+  }, [setProfile]);
 
   /* -------------------------------------------------------------- *
-   * The turn
+   * The live call
+   * -------------------------------------------------------------- */
+  const armDeadAir = useCallback(() => {
+    if (deadAir.current) clearTimeout(deadAir.current);
+    deadAir.current = setTimeout(() => {
+      if (callRef.current.status === "live") fns.current.endCall("abandoned");
+    }, DEAD_AIR_MS);
+  }, []);
+
+  const realtime = useRealtimeCall({
+    onUserSaid: useCallback(
+      (text) => {
+        armDeadAir();
+        pushMessage({ role: "user", kind: "text", text, viaVoice: true });
+      },
+      [armDeadAir, pushMessage],
+    ),
+
+    onAgentPartial: useCallback(
+      (text) => {
+        armDeadAir();
+        if (!text) return;
+        if (!liveAgentId.current) {
+          liveAgentId.current = pushMessage({
+            role: "assistant",
+            kind: "text",
+            text,
+            viaVoice: true,
+            pending: true,
+          });
+          return;
+        }
+        patchMessage(liveAgentId.current, { text, pending: true });
+      },
+      [armDeadAir, patchMessage, pushMessage],
+    ),
+
+    onAgentSaid: useCallback(
+      (text) => {
+        armDeadAir();
+        if (liveAgentId.current) {
+          patchMessage(liveAgentId.current, { text, pending: false });
+          liveAgentId.current = null;
+          return;
+        }
+        pushMessage({
+          role: "assistant",
+          kind: "text",
+          text,
+          viaVoice: true,
+        });
+      },
+      [armDeadAir, patchMessage, pushMessage],
+    ),
+
+    onTool: useCallback(
+      (name, args) => {
+        switch (name) {
+          case "remember": {
+            const saved = saveSlots(args);
+            return { saved: saved.length ? saved : "nothing new" };
+          }
+          case "show_board": {
+            const shown = showStage("focus");
+            return shown
+              ? { shown: true, note: "The board is on their screen now." }
+              : { shown: false, note: "It is already on their screen." };
+          }
+          case "connect_gmail": {
+            const shown = showGmailCard();
+            return shown
+              ? { shown: true, note: "The connect button is on their screen." }
+              : { shown: false, note: "It is already on their screen." };
+          }
+          case "finish": {
+            if (!canGraduate(profileRef.current)) {
+              const left = missingSlots(profileRef.current);
+              return {
+                done: false,
+                reason: `Not yet. Still open: ${left.join(", ")}. Ask for ${left[0]}.`,
+              };
+            }
+            setTimeout(() => {
+              fns.current.endCall("completed");
+              graduateNow();
+            }, 2200);
+            return { done: true };
+          }
+          case "hang_up": {
+            setTimeout(() => fns.current.endCall("completed"), 1600);
+            return { ended: true };
+          }
+          default:
+            return { ok: false, note: "No such tool." };
+        }
+      },
+      [graduateNow, saveSlots, showGmailCard, showStage],
+    ),
+
+    onStatus: useCallback(
+      (s: RealtimeStatus) => {
+        if (s === "live") {
+          setCall((c) => ({
+            ...c,
+            status: "live",
+            startedAt: c.startedAt ?? Date.now(),
+            notice: null,
+          }));
+          setProfile((p) => ({ ...p, phase: "call", callOffered: true }));
+          armDeadAir();
+        } else if (s === "connecting") {
+          setCall((c) => ({ ...c, status: "connecting" }));
+        }
+      },
+      [armDeadAir, setCall, setProfile],
+    ),
+
+    onFailure: useCallback(
+      (kind: RealtimeFailure, detail?: string) => {
+        console.warn("[call] failed", kind, detail);
+        const notice = FAILURE_NOTICE[kind];
+        setCall({ ...IDLE_CALL, status: "idle", notice });
+        setProfile((p) => ({ ...p, phase: "chat", callOffered: true }));
+        // Let the text agent pick it up in its own words.
+        fns.current.runTurn({
+          channel: "chat",
+          event: { type: "call_failed", reason: kind },
+        });
+      },
+      [setCall, setProfile],
+    ),
+  });
+
+  // Mirror the live meters onto the call state for the orb.
+  useEffect(() => {
+    if (callRef.current.status !== "live") return;
+    setCall((c) =>
+      c.status === "live" ? { ...c, levels: realtime.levels } : c,
+    );
+  }, [realtime.levels, setCall]);
+
+  useEffect(() => {
+    setCall((c) =>
+      c.muted === realtime.muted ? c : { ...c, muted: realtime.muted },
+    );
+  }, [realtime.muted, setCall]);
+
+  /* -------------------------------------------------------------- *
+   * The text turn
    * -------------------------------------------------------------- */
   const applyActions = useCallback(
     (actions: TurnAction[], hasText: boolean) => {
@@ -347,47 +517,18 @@ export function useOnboarding() {
           case "end_call":
             setTimeout(() => fns.current.endCall("completed"), 1200);
             break;
-          case "stage": {
-            if (stagesShownRef.current.has(action.stage)) break;
-            stagesShownRef.current.add(action.stage);
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: uid(),
-                role: "assistant",
-                kind: "stage",
-                text: "",
-                at: Date.now(),
-                data: { stageId: action.stage, status: "active" },
-              },
-            ]);
+          case "stage":
+            showStage(action.stage);
             break;
-          }
-          case "gmail_connect": {
-            if (gmailShownRef.current) break;
-            gmailShownRef.current = true;
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: uid(),
-                role: "assistant",
-                kind: "gmail-card",
-                text: "",
-                at: Date.now(),
-              },
-            ]);
+          case "gmail_connect":
+            showGmailCard();
             break;
-          }
           case "graduate":
             setTimeout(
               () => {
                 if (callRef.current.status !== "idle")
                   fns.current.endCall("completed");
-                setProfile((p) =>
-                  p.phase === "ready"
-                    ? p
-                    : { ...p, phase: "ready", finishedAt: Date.now() },
-                );
+                graduateNow();
               },
               hasText ? 900 : 0,
             );
@@ -395,7 +536,7 @@ export function useOnboarding() {
         }
       }
     },
-    [setMessages, setProfile],
+    [graduateNow, setMessages, setProfile, showGmailCard, showStage],
   );
 
   const runTurnFor = useCallback(
@@ -417,7 +558,6 @@ export function useOnboarding() {
         .filter((m) => m.text.trim().length > 0);
 
       const assistantId = uid();
-      const viaVoice = opts.channel === "voice";
       markBusy(true);
       setMessages((prev) => [
         ...prev,
@@ -428,28 +568,12 @@ export function useOnboarding() {
           text: "",
           at: Date.now(),
           pending: true,
-          viaVoice,
         },
       ]);
 
       let full = "";
-      let spokenChunks = 0;
-      let spokeAnything = false;
       const actions: TurnAction[] = [];
       let suggestions: string[] = [];
-
-      /** Speak whole sentences as they arrive so the line is never dead air. */
-      const speakReady = (final: boolean) => {
-        if (!viaVoice) return;
-        const chunks = splitForSpeech(full);
-        const upTo = final ? chunks.length : Math.max(0, chunks.length - 1);
-        if (upTo <= spokenChunks) return;
-        const say = chunks.slice(spokenChunks, upTo).join(" ");
-        spokenChunks = upTo;
-        if (!say.trim()) return;
-        spokeAnything = true;
-        enqueueSpeech(say, final);
-      };
 
       const { ok } = await runTurn(
         {
@@ -463,7 +587,6 @@ export function useOnboarding() {
             if (turnSeq.current !== seq) return;
             full += text;
             patchMessage(assistantId, { text: full, pending: true });
-            speakReady(false);
           },
           onPatch(patch) {
             if (turnSeq.current !== seq) return;
@@ -481,7 +604,7 @@ export function useOnboarding() {
                     ...slots[id],
                     value,
                     declined: false,
-                    source: viaVoice ? "voice" : "chat",
+                    source: "chat",
                   };
                 }
               }
@@ -529,7 +652,6 @@ export function useOnboarding() {
         (ok
           ? "Sorry, I lost that. Try me again."
           : "I dropped that one. Say it again?");
-      full = finalText;
 
       patchMessage(assistantId, {
         text: finalText,
@@ -537,58 +659,15 @@ export function useOnboarding() {
         errored: !full.trim(),
         suggestions: suggestions.length ? suggestions : undefined,
       });
-
-      speakReady(true);
       markBusy(false);
-
-      // A voice turn must always end with the mic back in the user's hands,
-      // including when the model said nothing at all.
-      if (viaVoice && !spokeAnything) fns.current.handOver();
-
       applyActions(actions, Boolean(finalText));
     },
-    [
-      applyActions,
-      enqueueSpeech,
-      markBusy,
-      patchMessage,
-      setMessages,
-      setProfile,
-    ],
+    [applyActions, markBusy, patchMessage, setMessages, setProfile],
   );
 
   /* -------------------------------------------------------------- *
-   * Call plumbing
+   * Call lifecycle
    * -------------------------------------------------------------- */
-  const armSilence = useCallback(() => {
-    clearSilence();
-    silenceRef.current = setTimeout(() => {
-      const c = callRef.current;
-      if (c.status !== "live" || c.agentSpeaking || c.textMode || c.muted)
-        return;
-      const strikes = c.silenceStrikes + 1;
-      setCall((prev) => ({ ...prev, silenceStrikes: strikes }));
-      if (strikes >= 3) {
-        fns.current.endCall("abandoned");
-        return;
-      }
-      void runTurnFor({
-        channel: "voice",
-        event: { type: "call_silence", strikes },
-      });
-    }, SILENCE_MS);
-  }, [clearSilence, runTurnFor, setCall]);
-
-  const handOver = useCallback(() => {
-    const c = callRef.current;
-    if (c.status !== "live") return;
-    if (!c.textMode && !c.muted && listenerRef.current) {
-      setCall((prev) => ({ ...prev, listening: true }));
-      listenerRef.current.start();
-    }
-    armSilence();
-  }, [armSilence, setCall]);
-
   const applyLocalIntent = useCallback(
     (text: string) => {
       const intent = readIntent(text);
@@ -603,136 +682,38 @@ export function useOnboarding() {
     [setProfile],
   );
 
-  const heard = useCallback(
-    (text: string, viaVoice: boolean) => {
-      const clean = text.trim().slice(0, 2000);
-      if (!clean) return;
-      if (callRef.current.status !== "live") return;
-      clearSilence();
-      listenerRef.current?.stop();
-      stopSpeech();
-      setCall((prev) => ({
-        ...prev,
-        listening: false,
-        agentSpeaking: false,
-        partial: "",
-        silenceStrikes: 0,
-      }));
-
-      const history = setMessages((prev) => [
-        ...prev,
-        {
-          id: uid(),
-          role: "user",
-          kind: "text",
-          text: clean,
-          at: Date.now(),
-          viaVoice,
-        },
-      ]);
-      applyLocalIntent(clean);
-      void runTurnFor({ channel: "voice", history });
-    },
-    [
-      applyLocalIntent,
-      clearSilence,
-      runTurnFor,
-      setCall,
-      setMessages,
-      stopSpeech,
-    ],
-  );
-
   const startCall = useCallback(() => {
     if (profileRef.current.callRefused) return;
-    const status = callStatus();
-    if (status !== "idle" && status !== "ended") return;
-    stopSpeech();
+    const s = callStatus();
+    if (s !== "idle" && s !== "failed") return;
     setCall({ ...IDLE_CALL, status: "ringing" });
-  }, [callStatus, setCall, stopSpeech]);
+  }, [callStatus, setCall]);
 
-  const answerCall = useCallback(async () => {
-    if (callStatus() !== "ringing") return;
-    setCall((c) => ({ ...c, status: "connecting" }));
-
-    const supported = canListen();
-    let micOk = supported;
-    if (supported && navigator.mediaDevices?.getUserMedia) {
-      try {
-        const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-        s.getTracks().forEach((t) => t.stop());
-      } catch {
-        micOk = false;
-      }
-    }
-    if (callStatus() !== "connecting") return;
-
-    listenerRef.current?.stop();
-    listenerRef.current = new Listener({
-      onPartial: (t) => setCall((c) => ({ ...c, partial: t })),
-      onFinal: (t) => heard(t, true),
-      onError: (kind) => {
-        if (kind === "denied") {
-          setCall((c) => ({
-            ...c,
-            micDenied: true,
-            textMode: true,
-            listening: false,
-            notice:
-              "Your mic is blocked. Type your answers and I'll keep talking.",
-          }));
-        } else if (kind === "network") {
-          setCall((c) => ({
-            ...c,
-            textMode: true,
-            listening: false,
-            notice: "Speech recognition dropped out. Typing still works.",
-          }));
-        }
-      },
-      onEnd: () => setCall((c) => ({ ...c, listening: false })),
-    });
-
-    setProfile((p) => ({ ...p, phase: "call", callOffered: true }));
-    setCall({
-      ...IDLE_CALL,
-      status: "live",
-      startedAt: Date.now(),
-      micDenied: !micOk,
-      textMode: !micOk,
-      notice: !supported
-        ? "This browser can't listen. Type your answers and I'll talk you through it."
-        : !micOk
-          ? "Your mic is blocked. Type your answers and I'll keep talking."
-          : null,
-    });
-
-    void runTurnFor({ channel: "voice", event: { type: "call_accepted" } });
-  }, [callStatus, heard, runTurnFor, setCall, setProfile]);
+  const answerCall = useCallback(() => {
+    if (callStatus() === "live" || callStatus() === "connecting") return;
+    setCall((c) => ({ ...c, status: "connecting", startedAt: Date.now() }));
+    void realtime.start(profileRef.current);
+  }, [callStatus, realtime, setCall]);
 
   const declineCall = useCallback(() => {
-    if (callRef.current.status === "idle") return;
+    if (callStatus() === "idle") return;
     setCall(IDLE_CALL);
     setProfile((p) => ({ ...p, callOffered: true, phase: "chat" }));
     void runTurnFor({ channel: "chat", event: { type: "call_declined" } });
-  }, [runTurnFor, setCall, setProfile]);
+  }, [callStatus, runTurnFor, setCall, setProfile]);
 
   const endCall = useCallback(
     (outcome: CallOutcome) => {
       const c = callRef.current;
       if (c.status === "idle") return;
-      clearSilence();
-      stopSpeech();
-      listenerRef.current?.stop();
-      listenerRef.current = null;
-      abortRef.current?.abort();
-      turnSeq.current++;
-      markBusy(false);
+      if (deadAir.current) clearTimeout(deadAir.current);
+      realtime.stop();
+      liveAgentId.current = null;
 
       const secs = c.startedAt
         ? Math.round((Date.now() - c.startedAt) / 1000)
         : 0;
-      setCall({ ...IDLE_CALL, status: "ended" });
+      setCall(IDLE_CALL);
 
       const updated = setProfile((p) => ({
         ...p,
@@ -744,7 +725,6 @@ export function useOnboarding() {
         ].slice(-6),
       }));
 
-      // Drop the half finished assistant bubble from the call, if any.
       const history = setMessages((prev) => [
         ...prev.filter((m) => !(m.pending && !m.text.trim())),
         {
@@ -757,8 +737,6 @@ export function useOnboarding() {
         },
       ]);
 
-      setTimeout(() => setCall(IDLE_CALL), 350);
-
       if (updated.phase !== "ready") {
         void runTurnFor({
           channel: "chat",
@@ -767,38 +745,8 @@ export function useOnboarding() {
         });
       }
     },
-    [
-      clearSilence,
-      markBusy,
-      runTurnFor,
-      setCall,
-      setMessages,
-      setProfile,
-      stopSpeech,
-    ],
+    [realtime, runTurnFor, setCall, setMessages, setProfile],
   );
-
-  const toggleMute = useCallback(() => {
-    const c = callRef.current;
-    const muted = !c.muted;
-    listenerRef.current?.setMuted(muted);
-    if (muted) listenerRef.current?.stop();
-    else if (!c.agentSpeaking && !c.textMode) listenerRef.current?.start();
-    setCall({
-      ...c,
-      muted,
-      listening: muted ? false : c.listening,
-      partial: "",
-    });
-  }, [setCall]);
-
-  const toggleTextMode = useCallback(() => {
-    const c = callRef.current;
-    const textMode = !c.textMode;
-    if (textMode) listenerRef.current?.stop();
-    else if (!c.agentSpeaking && !c.muted) listenerRef.current?.start();
-    setCall({ ...c, textMode, listening: false, partial: "" });
-  }, [setCall]);
 
   /* -------------------------------------------------------------- *
    * Public actions
@@ -806,17 +754,17 @@ export function useOnboarding() {
   const reset = useCallback(() => {
     abortRef.current?.abort();
     turnSeq.current++;
-    stopSpeech();
-    listenerRef.current?.stop();
-    listenerRef.current = null;
-    clearSilence();
+    realtime.stop();
+    if (deadAir.current) clearTimeout(deadAir.current);
     gmailShownRef.current = false;
+    stagesShownRef.current = new Set();
+    liveAgentId.current = null;
     persist.clear();
     setCall(IDLE_CALL);
     setProfile({ ...newProfile(), phase: "chat" });
     setMessages(openingMessages());
     markBusy(false);
-  }, [clearSilence, markBusy, setCall, setMessages, setProfile, stopSpeech]);
+  }, [markBusy, realtime, setCall, setMessages, setProfile]);
 
   const send = useCallback(
     (raw: string) => {
@@ -829,8 +777,11 @@ export function useOnboarding() {
         return;
       }
 
-      if (callRef.current.status === "live") {
-        heard(text, false);
+      // Typing mid call goes to the agent that is already listening.
+      if (onCall()) {
+        pushMessage({ role: "user", kind: "text", text, viaVoice: false });
+        applyLocalIntent(text);
+        realtime.sendText(text);
         return;
       }
 
@@ -838,26 +789,22 @@ export function useOnboarding() {
       turnSeq.current++;
       const history = setMessages((prev) => [
         ...prev.filter((m) => !(m.pending && !m.text.trim())),
-        {
-          id: uid(),
-          role: "user",
-          kind: "text",
-          text,
-          at: Date.now(),
-        },
+        { id: uid(), role: "user", kind: "text", text, at: Date.now() },
       ]);
       applyLocalIntent(text);
       void runTurnFor({ channel: "chat", history });
     },
-    [applyLocalIntent, heard, reset, runTurnFor, setMessages],
+    [
+      applyLocalIntent,
+      onCall,
+      pushMessage,
+      realtime,
+      reset,
+      runTurnFor,
+      setMessages,
+    ],
   );
 
-  /**
-   * A finished stage becomes a reply.
-   *
-   * Tapping a name is the same as typing it, so the agent reacts the same way
-   * and the transcript reads the same either way.
-   */
   const completeStage = useCallback(
     (messageId: string, result: string) => {
       setMessages((prev) =>
@@ -867,32 +814,62 @@ export function useOnboarding() {
             : m,
         ),
       );
+      if (onCall()) {
+        // The agent is mid sentence somewhere. Tell it what just happened
+        // rather than making it guess from a transcript it never heard.
+        pushMessage({ role: "user", kind: "text", text: result });
+        realtime.nudge(
+          `They just used the panel on their screen and chose: ${result}. Save it with remember, acknowledge it in a few words, and carry on.`,
+        );
+        return;
+      }
       send(result);
     },
-    [send, setMessages],
+    [onCall, pushMessage, realtime, send, setMessages],
   );
 
   const connectGmail = useCallback(
     (email: string) => {
       setGmailOpen(false);
+      if (onCall()) {
+        setProfile((p) => ({
+          ...p,
+          slots: {
+            ...p.slots,
+            gmail: {
+              ...p.slots.gmail,
+              value: email,
+              declined: false,
+              source: "oauth",
+            },
+          },
+        }));
+        realtime.nudge(
+          `They just connected ${email}. Acknowledge it in a few words and move to whatever is still open.`,
+        );
+        return;
+      }
       void runTurnFor({
-        channel: callRef.current.status === "live" ? "voice" : "chat",
+        channel: "chat",
         event: { type: "gmail_connected", email },
       });
     },
-    [runTurnFor],
+    [onCall, realtime, runTurnFor, setProfile],
   );
 
   const dismissGmail = useCallback(
     (opts: { connected: boolean }) => {
       setGmailOpen(false);
       if (opts.connected || profileRef.current.slots.gmail.value) return;
-      void runTurnFor({
-        channel: callRef.current.status === "live" ? "voice" : "chat",
-        event: { type: "gmail_dismissed" },
-      });
+      if (onCall()) {
+        realtime.nudge(
+          "They closed the Gmail sheet without connecting. Do not push, say you can come back to it, and move on.",
+        );
+        return;
+      }
+      void runTurnFor({ channel: "chat", event: { type: "gmail_dismissed" } });
     },
-    [runTurnFor],
+    [onCall, realtime, runTurnFor],
   );
 
   const openGmail = useCallback(() => setGmailOpen(true), []);
@@ -900,23 +877,20 @@ export function useOnboarding() {
   const graduate = useCallback(() => {
     abortRef.current?.abort();
     turnSeq.current++;
-    if (callRef.current.status !== "idle") endCall("completed");
-    stopSpeech();
+    if (callStatus() !== "idle") endCall("completed");
     markBusy(false);
-    setProfile((p) => ({ ...p, phase: "ready", finishedAt: Date.now() }));
-  }, [endCall, markBusy, setProfile, stopSpeech]);
+    graduateNow();
+  }, [callStatus, endCall, graduateNow, markBusy]);
 
-  // Close the cycle. A layout effect runs before anything can fire a timer or
-  // resolve a turn, so the handles are always current by the time they matter.
+  // Close the cycle for the callbacks defined before these.
   useLayoutEffect(() => {
     fns.current = {
-      drain: drainSpeech,
-      handOver,
-      startCall,
       endCall,
+      startCall,
       runTurn: (o) => void runTurnFor(o),
+      applyActions,
     };
-  }, [drainSpeech, endCall, handOver, runTurnFor, startCall]);
+  }, [applyActions, endCall, runTurnFor, startCall]);
 
   /* -------------------------------------------------------------- *
    * Timers and lifecycle
@@ -934,6 +908,15 @@ export function useOnboarding() {
   }, [call.status, call.startedAt, setCall]);
 
   useEffect(() => {
+    if (call.status !== "live" || !call.startedAt) return;
+    const left = Math.max(0, call.startedAt + MAX_CALL_MS - Date.now());
+    const id = setTimeout(() => {
+      if (callRef.current.status === "live") endCall("completed");
+    }, left);
+    return () => clearTimeout(id);
+  }, [call.status, call.startedAt, endCall]);
+
+  useEffect(() => {
     if (call.status !== "ringing") return;
     const id = setTimeout(() => {
       if (callRef.current.status === "ringing") declineCall();
@@ -945,7 +928,6 @@ export function useOnboarding() {
     const onVisibility = () => {
       if (document.hidden) {
         hiddenSinceRef.current = Date.now();
-        if (callRef.current.status === "live") stopSpeech();
         return;
       }
       const away = hiddenSinceRef.current
@@ -955,7 +937,6 @@ export function useOnboarding() {
 
       if (callRef.current.status === "live") {
         if (away > ABANDON_MS) endCall("abandoned");
-        else fns.current.handOver();
         return;
       }
       if (
@@ -971,23 +952,12 @@ export function useOnboarding() {
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => document.removeEventListener("visibilitychange", onVisibility);
-  }, [endCall, runTurnFor, stopSpeech]);
-
-  useEffect(() => {
-    const onUnload = () => {
-      stopSpeaking();
-    };
-    window.addEventListener("pagehide", onUnload);
-    return () => window.removeEventListener("pagehide", onUnload);
-  }, []);
+  }, [endCall, runTurnFor]);
 
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
-      speakRef.current?.cancel();
-      stopSpeaking();
-      listenerRef.current?.stop();
-      if (silenceRef.current) clearTimeout(silenceRef.current);
+      if (deadAir.current) clearTimeout(deadAir.current);
     };
   }, []);
 
@@ -1017,8 +987,7 @@ export function useOnboarding() {
     answerCall,
     declineCall,
     endCall,
-    toggleMute,
-    toggleTextMode,
+    toggleMute: realtime.toggleMute,
     openGmail,
     connectGmail,
     dismissGmail,

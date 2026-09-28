@@ -21,11 +21,38 @@ are allowed to graduate. The model writes the sentences and proposes values. Eve
 it proposes is normalised and validated before it reaches the profile, so a confused turn
 produces "ask again", never a corrupted setup.
 
-**The call is the product demo.** It is a real voice call in the browser: the agent
-speaks, listens, hears you, and reacts. It just does not dial a phone number.
+**The call is the product demo.** It is a real voice call in the browser, running
+on OpenAI's Realtime API over WebRTC: the agent speaks, listens, hears you and
+reacts in the same breath. It just does not dial a phone number.
 
 **Nobody answers a question twice.** Anything you have given survives a hangup, a
 refusal, a reload, and a browser with no microphone.
+
+## Voice
+
+Audio goes straight from the microphone to OpenAI and back over WebRTC, so the
+only thing this app sits in the middle of is the conversation. The browser never
+sees the API key: the server mints a token that is good for one short session,
+and that is what signs the handshake.
+
+The call does not take the screen away. It docks into a bar where the composer
+was, and everything else stays live: the transcript fills in as you both talk,
+the panels stay tappable, and typing still works mid call. Speak, tap or type,
+in any order.
+
+The voice agent has the same tools the text agent has, so both channels collect
+into the same contract and neither can take a shortcut the other cannot. What it
+hears goes through the same validation too, which is why saying "call me" out
+loud does not end up as your name.
+
+Turn taking is semantic rather than gap-based, so it waits for a finished
+thought instead of cutting in at the first pause, and it stops the moment you
+start talking. It will never ask you to say an email address out loud, because
+addresses do not survive a microphone; it puts a button on your screen instead.
+
+Calls end themselves after five minutes, or after a stretch of silence in both
+directions. Live audio is metered by the minute and onboarding is meant to take
+one.
 
 ## The panels
 
@@ -99,7 +126,9 @@ src/
     use-onboarding.ts     the client state machine and call loop
   components/onboarding/
     agent-stage.tsx       the interactive panels
-  lib/speech/             Web Speech, defensively wrapped
+  lib/speech/
+    use-realtime-call.ts  the WebRTC call: audio, events, tools
+  app/api/realtime/       mints the short lived session token
 ```
 
 Turns stream newline delimited JSON, so on a call each finished sentence is spoken while
@@ -122,20 +151,25 @@ question, and deterministic parsing still records the answer.
 
 ```bash
 pnpm install
-cp .env.example .env.local     # add an AI Gateway key
+cp .env.example .env.local     # an AI Gateway key, and an OpenAI key for voice
 pnpm dev
 ```
 
+Text works without the OpenAI key; voice reports itself unavailable and the
+onboarding carries on typing.
+
 ```bash
 pnpm test:e2e                  # the full matrix above, against localhost
-node e2e/stress.cjs call       # one scenario
+VOICE_LIVE=1 pnpm test:e2e     # also place one real call, which costs real credit
+node e2e/stress.cjs voiceRing  # one scenario
 BASE=https://... pnpm test:e2e # against a deployment
 pnpm check:slots               # the normalisers, against their awkward cases
 pnpm typecheck && pnpm lint
 ```
 
-Speech recognition needs Chrome or Edge. Everywhere else the call runs with captions and
-typed replies, which is a supported path rather than a failure.
+Voice needs WebRTC and a microphone, which is every current browser. Where it is
+unavailable or refused, the onboarding says so and finishes in text, which is a
+supported path rather than a failure.
 
 ## Notes
 
